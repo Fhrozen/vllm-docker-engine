@@ -216,5 +216,9 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+vllm
+vllm/
+extra_repos/
+
 # Streamlit
 .streamlit/secrets.toml
