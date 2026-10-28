@@ -222,3 +222,6 @@ extra_repos/
 
 # Streamlit
 .streamlit/secrets.toml
+
+vllm-omni
+vllm-omni/
