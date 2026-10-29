@@ -37,7 +37,12 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | `test` (76 tests) | exit 0, all passed after the ownership fix |
 | `test` (77 tests) | exit 0, all passed after the selection fix |
 | `test` (88 tests) | exit 0, all passed after the evaluation decisions |
+| `test` (91 tests) | exit 0, all passed after the 15 uncovered findings were decided |
+| `test` (92 tests) | exit 0, all passed after the maps-reader test |
+| `gate` on `tools/measure_runtime_libs.py` `tests/test_packaging.py` `docker/run.sh` | clean |
 | `gate` on `docs/SIZES.md` `docs/PACKAGING.md` `docs/DOCKER.md` `packaging/rules/vllm.json` `docker/Dockerfile.vllm` `docker/run.sh` | clean |
+| `gate` on `docs/SIZES.md` `docs/PACKAGING.md` `docs/DOCKER.md` `docker/run.sh` `wiki.md` after the docs pass | clean; markdownlint 0 issues in 3 gated files, `wiki.md` skipped as outside the gated pattern. Re-gated `docs/SIZES.md` alone after the triton cache subsection: clean |
+| `test` re-run after the docs pass | 92 passed, exit 0 |
 | GPU read through the harness (`bash docker/run.sh gpu`) | `NVIDIA GeForce RTX 3060`, compute cap 8.6 → `sm_86` |
 | evaluation run after the decisions | entry import completed in round 1, gate clean |
 | first build, hard gate | printed nothing: `bytecode: pyc-only` removes the `.py` files from the shipped tree, so `pkg.rglob("*.py")` found no files and the gate passed on an empty set. The scan now takes the selection (`package.select`) and reads the source tree, so the chosen files are scanned whichever form they ship in |
@@ -202,6 +207,48 @@ What the runs measured:
   real step instead of printing "strip: tool unavailable, skipping". binutils
   stays in stage 1; the runtime image is checked for `strip` by the R01 gate.
 
+Runtime library set, measured on the GPU (`tools/measure_runtime_libs.py`, which reads
+`/proc/self/maps` after a workload runs):
+
+- Workload `blas, conv, triton, sparse, distributed` on `sm_86`: **38 files mapped,
+  5,798.9 MB** of the 9,677.0 MB of libraries in the tree. Per tree: nvidia 25 files
+  (3,807.4 MB), torch 8 (1,537.2 MB), triton 1 (415.6 MB), numpy 2 + numpy.libs 3.
+- The `DT_NEEDED` closure alone (20 libs / 2,904.2 MB) badly **underestimates** what
+  the process loads: `libcudnn_graph`, `libcudnn_heuristic`,
+  `libcudnn_engines_precompiled`, `libcudnn_engines_runtime_compiled` and
+  `libtriton.so` are reached through `dlopen`/`ctypes` from Python and appear in no
+  ELF's `DT_NEEDED`. A "nothing links it" list is a candidate list, not a verdict.
+- `libcudnn_adv` (285.2 MB) and `libcudnn_cnn` (13.1 MB) were **not** mapped by this
+  conv; a vision encoder or a different conv shape can still reach them, so the cudnn
+  tree is not prunable without a model-specific run.
+- `libcusolverMg.so.11` (161.5 MB), `libnvrtc.alt` (105.0 MB), `libnvperf_host` (51.7
+  MB), `libtilelang.so` (28.6 MB), `libcute_dsl_runtime.so` (87.5 MB) and
+  `libtriton_amd_codegen.so` (96.0 MB) were not mapped. Only
+  `libtriton_amd_codegen.so` is dead on NVIDIA by design (AMD codegen); the others are
+  reached through guarded Python `ctypes`/`find_spec` paths.
+- Runtime import closure from the entry path: **90 packages / 4,161.8 MB** — the set of
+  distributions a shipped file imports at module level.
+
+Triton and the no-compiler rule (R01), measured:
+
+- `triton/runtime/build.py` looks for `clang`/`gcc` (or `CC`) on first use and raises
+  `RuntimeError: Failed to find C compiler` when neither is present. The tools
+  container has no compiler, so the first triton kernel launch failed there.
+- `compile_module_from_src` checks the cache **before** the compiler, so a warm cache
+  is enough: the same kernel ran in a compiler-free container once the cache was
+  warmed by a run that had `gcc` + `libc6-dev` (gcc alone is not enough — `cuda.h`
+  includes `<stdlib.h>` and the compile failed on it).
+- A kernel the cache had never seen still failed in the compiler-free container. So
+  the runtime image can only run kernels that were compiled in the build stage: the
+  build stage must pre-compile the kernels the target model uses, which is the same
+  conclusion as the vendored-cubin approach in the reference clone.
+- Cache key is `sha256(src + platform_key())` where `platform_key()` is
+  `machine, system, architecture` — no GPU arch in it, so a cache built in stage 1 is
+  valid in stage 3 as long as both are x86_64 Linux with the same Python. The kernel
+  artifacts themselves are arch-specific.
+- Minimum warm cache for this test: 10 files, 0.07 MB (two C extensions plus one
+  kernel). A real serving run compiles many kernels.
+
 Two false readings this phase, both corrected by re-running:
 
 - `rules_mod.matches(rel, pattern)` called with a bare string iterates
@@ -278,7 +325,14 @@ Bugs the container run exposed:
    so the `.cpp`/`.cc` trees in the selection cannot be used there. Pruning them
    is only safe if nothing on the entry path compiles at import time — flashinfer
    is the case to check on the GPU, because on sm_86 it has no prebuilt kernels.
-4. Uncovered gate: the 14 plugin `DT_NEEDED` entries need a decision — prune the
-   plugin trees or declare `libgomp`/`libtbb`/RDMA/MPI as system libraries.
-5. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
+4. Uncovered gate: **0 findings** after the decisions (was 14, then 13, then 3). The
+   `libgomp.so.1` glob was widened to `libgomp.so.*` because apt installs
+   `libgomp.so.1.0.0` plus a symlink, and foreign-arch ELF files are now refused by
+   `select()` (the build run failed at `strip` on cutlass-dsl aarch64 stubs).
+5. Decide R01 vs triton (mechanism measured, decision recorded as `Plan.md` finding 5):
+   either the build stage warms and ships the triton cache for the target model and
+   arch, or R01 is relaxed for the runtime image. The choice changes what the build
+   stage must run and what the package must carry, so it is decided before the build
+   is re-run.
+6. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
    `bash docker/run.sh script tools/compare_packaging.py`.

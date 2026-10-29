@@ -16,11 +16,25 @@ bash docker/run.sh runtime <image>             # R01 config gate
 bash docker/run.sh measure <image>             # cold start, tokens/s, peak GPU
 bash docker/run.sh gpu "<command>"             # a command with a GPU attached
 bash docker/run.sh py "<snippet>"              # run a snippet in the container
+bash docker/run.sh script <file> [args]        # run a repo script in the container
+bash docker/run.sh spike-run "<command>"       # a command that needs a compiler
+bash docker/run.sh compile "<command>"         # a command with gcc + libc6-dev
 ```
 
 The `gpu` task is what makes arch detection possible: the tools container has no
 GPU, so `arch.detect()` there always falls back to the full list. Measured with
 the GPU attached, the target is `sm_86`.
+
+The `spike` and `spike-run` tasks use `nvidia/cuda:12.8.1-devel-ubuntu24.04`.
+That default was corrected after a run: `12.4.1-devel-ubuntu24.04` does not exist
+in the registry (manifest unknown), and `*-devel-ubuntu24.04` images have no
+`python3`, so a measurement in those images must not assume an interpreter.
+
+The `compile` task exists because the pinned tools image has no C compiler by
+design. triton looks up its cache **before** looking up a compiler, so a cache
+miss in the runtime image is a hard failure under R01. The build stage must warm
+triton's cache for the shapes the target model uses and ship it; the cache key
+contains no GPU architecture, so warming must happen on the target arch.
 
 The tools image holds the pinned gate versions from the reference clone's
 pre-commit config: ruff 0.14.10, typos 1.49.0, markdownlint-cli2 0.23.2,
@@ -76,7 +90,7 @@ Recorded from runs inside the container:
 
 - gates: clean on 6 explicitly passed files (the evaluation changes), and clean
   on 27 files in the earlier run
-- tests: 88 passed, exit 0
+- tests: 92 passed, exit 0
 - GPU read through the harness: `NVIDIA GeForce RTX 3060`, compute cap 8.6, so
   the target arch is `sm_86`
 - `check_files.py` with no arguments: exit 1, refuses

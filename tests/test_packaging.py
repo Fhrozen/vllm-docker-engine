@@ -424,6 +424,29 @@ def test_lock_round_trip_and_gate(tmp_path):
     assert any("wheel not in lock" in p for p in lock_mod.check(lock, wheelhouse))
 
 
+def test_write_lock_refuses_two_versions_of_one_distribution(tmp_path):
+    # A wheelhouse is a directory, so a second download run into the same folder
+    # leaves the older wheel beside the newer one. The lock is a reading of the
+    # wheelhouse, so it would list both and pip would be asked to install both,
+    # which cannot be resolved. A real run hit this with compressed-tensors
+    # 0.13.0 and 0.15.0.1.
+    wheelhouse = tmp_path / "wh"
+    wheelhouse.mkdir()
+    for name in (
+        "compressed_tensors-0.13.0-py3-none-any.whl",
+        "compressed_tensors-0.15.0.1-py3-none-any.whl",
+    ):
+        (wheelhouse / name).write_text("x\n")
+    lock = tmp_path / "lock.txt"
+    try:
+        lock_mod.write_lock(wheelhouse, lock, "linux-x86_64")
+    except SystemExit as exc:
+        assert "compressed-tensors" in str(exc)
+        assert not lock.exists(), "the lock was written despite the conflict"
+    else:
+        raise AssertionError("two versions of one distribution were accepted")
+
+
 def test_check_accepts_tags_below_the_runtime_floor(tmp_path):
     # blake3 publishes only manylinux_2_17 wheels, so a pinned single platform
     # tag cannot resolve a real requirement set. The gate is the runtime base
@@ -862,6 +885,38 @@ def test_uncovered_names_a_needed_library_that_is_not_bundled(tmp_path):
     assert libdeps.uncovered(pkg) == []
 
 
+def _elf(machine: int) -> bytes:
+    """A minimal ELF header with the given e_machine, enough for the gate."""
+    return (
+        b"\x7fELF\x02\x01\x01\x00"
+        + b"\x00" * 8
+        + b"\x03\x00"
+        + machine.to_bytes(2, "little")
+    )
+
+
+def test_system_lib_glob_covers_the_file_apt_installs():
+    # Measured on ubuntu:24.04: libgomp1 installs libgomp.so.1.0.0 and a
+    # libgomp.so.1 symlink. The exact glob matched only the symlink name, so a
+    # real import (numba's omppool) stayed uncovered in the gate.
+    assert libdeps.is_system("libgomp.so.1.0.0")
+    assert libdeps.is_system("libgomp.so.1")
+
+
+def test_select_refuses_an_elf_for_another_architecture(tmp_path):
+    # The build run hit these as strip failures: cutlass-dsl ships stubs built
+    # for aarch64, which an x86_64 image can never load.
+    pkg = tmp_path / "pkg"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "lib" / "libcute_dsl_runtime.so").write_bytes(_elf(0xB7))
+    (pkg / "lib" / "libruntime.so").write_bytes(_elf(0x3E))
+    picked = package.select(pkg, rule(), ["sm_86"])
+    assert "lib/libruntime.so" in picked
+    assert "lib/libcute_dsl_runtime.so" not in picked
+    assert libdeps.elf_machine(pkg / "lib" / "libcute_dsl_runtime.so") == 0xB7
+    assert libdeps.machine_for_platform("linux-x86_64") == 0x3E
+
+
 def test_write_system_libs_records_only_system_imports(tmp_path):
     ssl = system_lib("libssl.so*")
     if ssl is None:
@@ -995,6 +1050,34 @@ def test_stub_reproduces_the_distributed_verdict(monkeypatch):
         from torch.distributed import Backend  # noqa: F401
 
     assert getattr(dist, "ProcessGroup", None) is not None
+
+
+# runtime library measurement ---------------------------------------------
+
+
+def test_maps_reader_takes_the_path_field(tmp_path):
+    import measure_runtime_libs
+
+    maps = tmp_path / "maps"
+    maps.write_text(
+        "7f0000000000-7f0000001000 r-xp 00000000 08:01 123 "
+        "/site-packages/nvidia/cublas/lib/libcublas.so.12\n"
+        "7f0000002000-7f0000003000 rw-p 00000000 00:00 0 \n"
+        "7f0000004000-7f0000005000 r--p 00000000 08:01 456 "
+        "/site-packages/torch/lib/libtorch_cpu.so\n"
+        "7f0000006000-7f0000007000 r--p 00000000 08:01 457 "
+        "/site-packages/nvidia/cufile/lib/libcufile_rdma.so.1\n"
+    )
+    found = measure_runtime_libs.mapped_libs(str(maps))
+    assert found == [
+        "/site-packages/nvidia/cublas/lib/libcublas.so.12",
+        "/site-packages/nvidia/cufile/lib/libcufile_rdma.so.1",
+        "/site-packages/torch/lib/libtorch_cpu.so",
+    ]
+    # The remainder of the line is not the path: it starts with the offset, so
+    # reading it instead of the last field would match nothing.
+    remainder = maps.read_text().splitlines()[0].split(" ", 1)[-1]
+    assert not remainder.startswith("/")
 
 
 # size gate ---------------------------------------------------------------

@@ -19,7 +19,10 @@ CACHE="${VDE_CACHE_VOLUME:-vde-tools-cache}"
 SOCKET="${VDE_DOCKER_SOCKET:-/var/run/docker.sock}"
 WORKDIR="/workspace"
 GPUS="${VDE_GPUS:-device=0}"
-SPIKE_IMAGE="${VDE_SPIKE_IMAGE:-nvidia/cuda:12.4.1-devel-ubuntu24.04}"
+# 12.4.1-devel-ubuntu24.04 does not exist on the registry (manifest unknown);
+# 12.8.1-devel-ubuntu24.04 does, and it matches the CUDA 12.8 libraries measured
+# in the wheelhouse for this rule.
+SPIKE_IMAGE="${VDE_SPIKE_IMAGE:-nvidia/cuda:12.8.1-devel-ubuntu24.04}"
 
 # The bind-mounted repo is owned by the host uid, so git inside the container
 # refuses the index as "dubious ownership". Configure it through env rather than
@@ -134,6 +137,34 @@ case "$TASK" in
             --entrypoint bash \
             "$SPIKE_IMAGE" -c "bash $WORKDIR/tools/spike_torch_distributed.sh $*"
         ;;
+    compile)
+        # The tools image has no C compiler on purpose (R01). This task installs
+        # gcc and the C headers for one run only, to measure what a build stage
+        # can pre-produce and what the runtime image then needs. The pinned image
+        # is not changed. triton needs both: gcc alone fails on <stdlib.h>.
+        # shellcheck disable=SC2086
+        docker run --rm \
+            --gpus ${GPUS} \
+            -v "$REPO:$WORKDIR" \
+            -v "$CACHE:/root/.cache" \
+            -e PYTHONPATH="$WORKDIR" \
+            -e VDE_WORKDIR="$WORKDIR" \
+            "$TOOLS" bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends gcc libc6-dev >/dev/null && $*"
+        ;;
+    spike-run)
+        # A command in the CUDA devel container. Needed for measurements that
+        # require a compiler (triton builds a C extension at runtime) or nvcc.
+        # shellcheck disable=SC2086
+        docker run --rm \
+            --gpus ${GPUS} \
+            -v "$REPO:$WORKDIR" \
+            -v "$CACHE:/root/.cache" \
+            -v "$SOCKET:/var/run/docker.sock" \
+            -e PYTHONPATH="$WORKDIR" \
+            -e VDE_WORKDIR="$WORKDIR" \
+            --entrypoint bash \
+            "$SPIKE_IMAGE" -c "$*"
+        ;;
     gpu)
         # A command in the tools container with a GPU attached, for arch detection.
         # shellcheck disable=SC2086
@@ -165,6 +196,8 @@ docker/run.sh <task> [args]
   measure <image>       cold start, tokens/s, peak GPU memory
   serve-smoke <image>   fixed-seed inference against a running container
   spike [variant]       libtorch build variants (CUDA devel container)
+  spike-run "<command>" run a command in the CUDA devel container (needs a compiler)
+  compile "<command>"   run a command with gcc + libc6-dev installed for one run
   gpu "<command>"       run a command in the tools container with a GPU attached
   shell                 interactive shell inside the container
 

@@ -87,6 +87,20 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   name (hash-named cubins) cannot be arch-filtered, so that split has to be measured by hand.
 - The evaluation view must start clean. A reused view reports a package as reachable because an
   earlier round put it back.
+- `package.select()` returns **relative posix path strings**, not `Path` objects. `install_locked()`
+  needs `Path`, so passing selection strings raises `AttributeError`.
+- `build()` runs the uncovered gate on the staged folder **before** the atomic rename, so a failing
+  build leaves no package folder behind.
+- `strip` must be gated by `is_elf()` **and** by ELF machine: `elf_soname()` raises `IndexError` on a
+  non-ELF file, and `select()` already refuses a foreign-arch ELF, so a `.so` that fails `strip` is
+  a machine mismatch, not a corrupt file.
+- The wheelhouse is the source of the lock and must start empty. It is a directory, so a second
+  download leaves the older wheel beside the newer one, and a lock listing both cannot install.
+- `rules.load()` returns a **dict**, so rule fields are `rule["system_libs"]`, not attributes.
+- Triton needs a C compiler at runtime unless its cache is pre-warmed, and the cache is checked
+  **before** the compiler is looked up. `cc` alone is not enough — compiling also needs `libc6-dev`
+  headers. Triton's cache key contains no GPU architecture, so the build stage must warm the cache
+  on the target arch and ship it.
 - Forbidden suffixes in the shipped tree: `.a`, `.o`, `.cmake`, plus `pkgconfig/` and dev headers —
   except when the `.pyc`-only mode is *not* chosen, in which case `.py` is allowed by rule.
 
@@ -103,6 +117,27 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 - The build context is assembled from an allow-list (`packaging/`, `docker/`, `tools/`) through
   `git ls-files --cached --others --exclude-standard`. Tracked files alone are not enough: a new
   file is silently absent from the context, and the build fails at its first import.
+
+## Running things
+
+`docker/run.sh` is the only host-side entry point. Tasks: `image`, `build`, `gate`, `test`,
+`script`, `py`, `dist`, `size`, `runtime`, `measure`, `serve-smoke`, `spike`, `spike-run`,
+`compile`, `gpu`, `shell`. Everything runs in the pinned tools container; `gpu` runs a command in
+a GPU container because the tools container has no GPU, so arch detection there always falls back
+to the full list. `spike-run` and `compile` exist because the pinned tools image has no C
+compiler on purpose — triton builds a C extension at runtime, so a measurement that needs a
+compiler must run in the CUDA devel container or in a one-run container that installs gcc and
+`libc6-dev`.
+
+Two mechanisms answer "what must ship", and they must both be used:
+
+- **Static**: `packaging/libdeps.py` reads `DT_NEEDED` from ELF files. This proves what the loader
+  is asked to map, and it is what the uncovered gate enforces.
+- **Dynamic**: `tools/measure_runtime_libs.py` reads `/proc/self/maps` after a workload runs. This
+  proves what a workload actually uses, and it catches libraries reached through `dlopen()` or
+  `ctypes.CDLL()`, which `DT_NEEDED` cannot see.
+
+The dynamic view is the one that can prune; the static view is the one that can fail a build.
 
 ## Environment facts (this host)
 

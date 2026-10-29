@@ -207,6 +207,35 @@ split had to be measured by hand before the package could be denied.
 The decisions the evaluation produced are in `packaging/rules/vllm.json`, and
 the numbers behind them are in `docs/SIZES.md`.
 
+### What the reverse closure cannot prove
+
+`elf_needed()` reports what a binary asks the loader to map. It cannot see a
+library reached through `dlopen()` or `ctypes.CDLL()`, so "nothing links it" is
+a candidate list, not a verdict. `tools/measure_runtime_libs.py` records what a
+workload actually maps, through `/proc/self/maps`, and lists what the selection
+holds but the process never loaded. Both views are needed: the gate proves a
+library is reachable, the run proves which ones are used.
+
+The same gap runs the other way. `importscan` reads source files, so a package
+whose shipped form is `.pyc` only cannot be scanned — `runtime_conflicts()`
+takes the selection so it reports conflicts for files that will actually be in
+the image.
+
+### Triton and the no-compiler rule
+
+R01 forbids a compiler in the runtime image, and triton needs one: a cache miss
+raises `CompilationError`, and the compiler lookup happens after the cache is
+checked. `cc` alone is not enough — compiling also needs `libc6-dev` headers.
+So the build stage must warm triton's cache for the shapes the target model
+uses, and the warm cache must travel in the package. The cache key contains no
+GPU architecture, so a cache warmed for one arch is read on another; the cache
+is arch-scoped only by the code it contains, which is why the build stage must
+warm it on the target arch.
+
+Minimum warm cache for one kernel: 10 files, 0.07 MB. A cache covering the
+shapes a model uses is small enough to ship, so R01 can stand. The choice is
+recorded in `Plan.md` as an open decision.
+
 ## Driver boundary
 
 `libcuda.so.1` and `libnvidia-*` are never bundled. The host driver provides

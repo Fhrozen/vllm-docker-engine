@@ -50,6 +50,13 @@ number from this repo's own harness.
 4. **vllm.cpp is not the engine** (from-scratch reimplementation, prerelease, no run gate for the
    target model, no distributed, hardcoded block count). Its build/size/gate techniques are
    harvested — see `docs/PACKAGING.md`.
+5. **R01 and triton are in conflict unless the cache is pre-warmed.** triton raises
+   `Failed to find C compiler` on a cache miss, and the cache is checked before the compiler,
+   so a runtime image with no compiler can only run kernels the build stage compiled. gcc
+   alone is not enough (compiling needs `libc6-dev` headers). The cache key carries no GPU
+   arch, so the build stage must warm it on the target arch and ship it. Minimum measured warm
+   cache: 10 files / 0.07 MB. **Open decision:** ship a build-stage-warmed cache (R01 stands),
+   or relax R01 for the runtime image. Numbers in `docs/SIZES.md`.
 
 ## Phases
 

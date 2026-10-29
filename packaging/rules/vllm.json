@@ -51,7 +51,8 @@
     "datasets",
     "soundfile",
     "xformers",
-    "flashinfer-cubin"
+    "flashinfer-cubin",
+    "cupy-cuda12x"
   ],
   "prune": [
     "**/tests/**",
@@ -73,7 +74,17 @@
     "**/*.map",
     "**/*.ipynb",
     "**/test-data/**",
-    "**/testdata/**"
+    "**/testdata/**",
+    "numba/np/ufunc/tbbpool*",
+    "nvidia/nvshmem/lib/*.bc",
+    "nvidia/nvshmem/lib/nvshmem_bootstrap_mpi.so*",
+    "nvidia/nvshmem/lib/nvshmem_bootstrap_pmix.so*",
+    "nvidia/nvshmem/lib/nvshmem_bootstrap_shmem.so*",
+    "nvidia/nvshmem/lib/nvshmem_transport_libfabric.so*",
+    "nvidia/nvshmem/lib/nvshmem_transport_ucx.so*",
+    "nvidia/nvshmem/lib/nvshmem_transport_ibgda.so*",
+    "nvidia/nvshmem/lib/nvshmem_transport_ibdevx.so*",
+    "nvidia/cufile/lib/libcufile_rdma.so*"
   ],
   "bytecode": "pyc-only",
   "strip": true,

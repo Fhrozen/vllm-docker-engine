@@ -56,7 +56,10 @@ SYSTEM_LIBS = (
     "libnss_*.so.*",
     "libgcc_s.so.1",
     "libstdc++.so.6",
-    "libgomp.so.1",
+    # The glob has to cover the file apt actually installs, not the soname:
+    # `libgomp1` on ubuntu:24.04 ships libgomp.so.1.0.0 plus a libgomp.so.1
+    # symlink, so `libgomp.so.1` alone left a real import uncovered.
+    "libgomp.so.*",
     "libatomic.so.1",
     "libz.so.1",
     "libnuma.so.1",
@@ -102,6 +105,28 @@ def is_elf(path: Path) -> bool:
             return stream.read(4) == ELF_MAGIC
     except OSError:
         return False
+
+
+#: e_machine values for the platforms a package can be built for.
+MACHINES = {"x86_64": 0x3E, "aarch64": 0xB7}
+
+
+def elf_machine(path: Path) -> int | None:
+    """e_machine, or None when the file is not an ELF object."""
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(20)
+    except OSError:
+        return None
+    if data[:4] != ELF_MAGIC or len(data) < 20:
+        return None
+    le = "<" if data[5] == 1 else ">"
+    return struct.unpack_from(le + "H", data, 18)[0]
+
+
+def machine_for_platform(platform: str) -> int | None:
+    """The e_machine a runtime image can execute, e.g. linux-x86_64."""
+    return MACHINES.get(platform.split("-", 1)[-1])
 
 
 def _dyn_strings(path: Path) -> tuple[list[tuple[int, int]], int, bytes]:

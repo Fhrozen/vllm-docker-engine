@@ -43,6 +43,7 @@ Target GPU, read from the container: `NVIDIA GeForce RTX 3060`, compute cap
 | --- | --- |
 | Selection, rule as previously committed | 51,514 files, 11,021.6 MB |
 | Selection, rule after the decisions below | 44,441 files, 9,986.6 MB |
+| Selection, rule as it now stands (`sm_86`) | 47,917 files, 10,505.7 MB |
 | Wheelhouse (compressed download) | 5,364.3 MB, 189 wheels |
 | Compressed share of the unpacked selection | 48.7 % |
 
@@ -73,6 +74,60 @@ The 18 largest files are 62.9 % of the selection: `libtorch_cuda.so` 1043.8,
 `libcusolverMg.so.11` 161.5, `libnvshmem_host.so.3` 160.3,
 `_vllm_fa3_C.abi3.so` 146.7 MB. None of these is prunable by a glob: they are
 the libraries libtorch links.
+
+## What the process actually loads
+
+The selection is what the rule ships. What a running process needs is a
+different measurement, taken by reading `/proc/self/maps` after a workload
+(`tools/measure_runtime_libs.py`, run in a container with a GPU attached):
+
+| Workload | Files mapped | Mapped MB | Not mapped MB |
+| --- | --- | --- | --- |
+| blas + conv + triton + sparse + distributed | 38 | 5,798.9 | 3,878.1 |
+| triton only, warm cache | 34 | 5,165.3 | — |
+
+Mapped trees for the first run: nvidia 25 files (3,807.4 MB), torch 8
+(1,537.2 MB), triton 1 (`libtriton.so`, 415.6 MB), numpy 2, numpy.libs 3.
+
+The `DT_NEEDED` closure is 20 libraries / 2,904.2 MB, which badly
+underestimates the process: `libcudnn_graph`, `libcudnn_heuristic`,
+`libcudnn_engines_precompiled`, `libcudnn_engines_runtime_compiled` and
+`libtriton.so` are reached through `dlopen` or `ctypes` from Python and appear
+in no ELF `DT_NEEDED`. A "nothing links it" list is therefore a candidate
+list, not a verdict.
+
+Libraries the workload did not map, kept as candidates only:
+
+| Library | MB | Why it is not pruned |
+| --- | --- | --- |
+| `libcudnn_adv.so.9` | 285.2 | a conv shape or vision encoder can reach it |
+| `libcusolverMg.so.11` | 161.5 | read by `cuda/pathfinder` through `ctypes` |
+| `libnvrtc.alt.so.12` | 105.0 | alternative nvrtc, selected at runtime |
+| `libtriton_amd_codegen.so` | 96.0 | AMD codegen, dead on NVIDIA by design |
+| `libcute_dsl_runtime.so` | 87.5 | loaded by 4 cutlass source files |
+| `libnvperf_host.so` | 51.7 | profiling path, guarded import |
+| `libtilelang.so` | 28.6 | loaded by 2 tilelang cache files |
+| `libcudnn_cnn.so.9` | 13.1 | conv path not exercised by this shape |
+| `libnvperf_target.so` | 10.6 | profiling path, guarded import |
+
+Runtime import closure from the entry path: 90 distributions / 4,161.8 MB —
+the set of packages a shipped file imports at module level.
+
+### Triton cache, measured
+
+The runtime image has no compiler, so triton can only run kernels the build
+stage compiled. Measured in the container:
+
+- cache hit → runs; cache miss + no compiler → `Failed to find C compiler`.
+  The cache is checked **before** the compiler is looked up.
+- `gcc` alone cannot compile; `libc6-dev` headers are needed too.
+- Cache key is `sha256(src + machine, system, architecture)` — no GPU arch, so
+  a stage-1 cache is read in stage 3 on the same x86_64 Linux + Python. The
+  kernel artifacts themselves are arch-specific.
+- Minimum warm cache for one kernel: **10 files / 0.07 MB**. A serving run
+  compiles many kernels, so the shipped cache is small but not fixed in size.
+
+The decision this produces is recorded in `Plan.md` finding 5.
 
 ## What the measurements changed
 

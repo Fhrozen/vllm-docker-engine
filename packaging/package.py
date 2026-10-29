@@ -59,6 +59,7 @@ def select(
 ) -> list[str]:
     """Relative paths that the rule wants, sorted, no symlinks, no statics."""
     picked: list[str] = []
+    want = libdeps.machine_for_platform(rule["platform"])
     for path in sorted(src.rglob("*")):
         if path.is_symlink():
             continue
@@ -72,6 +73,11 @@ def select(
         if libdeps.is_static(rel):
             continue
         if rule.get("arch_filter") and not arch_mod.arch_wanted(rel, archs):
+            continue
+        # An ELF object for another architecture cannot be loaded by this image.
+        # The build run hit this as a strip failure on cutlass-dsl stubs built for
+        # aarch64, which is the same defect seen from the other side.
+        if want is not None and libdeps.elf_machine(path) not in (None, want):
             continue
         picked.append(rel)
     return sorted(picked)

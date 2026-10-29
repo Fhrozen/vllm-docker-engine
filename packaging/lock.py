@@ -287,6 +287,27 @@ def write_lock(wheelhouse: Path, dest: Path, target: str) -> int:
         entries.append((key, sha256(path)))
     if not entries:
         raise SystemExit(f"wheelhouse has no wheels: {wheelhouse}")
+
+    # One distribution may not appear twice. A wheelhouse is a directory, so a
+    # second download run into the same folder leaves the older version next to
+    # the newer one, and the lock then asks pip to install both at once, which
+    # cannot be resolved. The lock is only a reading of the wheelhouse, so the
+    # conflict has to be reported here rather than left for the install.
+    versions: dict[str, list[str]] = {}
+    for name, version in sorted({k for k, _ in entries}):
+        versions.setdefault(name, []).append(version)
+    dupes = {n: v for n, v in versions.items() if len(v) > 1}
+    if dupes:
+        raise SystemExit(
+            "wheelhouse has more than one version of the same distribution, "
+            "and a lock that lists both cannot be installed:\n  "
+            + "\n  ".join(
+                f"{n}: {', '.join(sorted(v))}" for n, v in sorted(dupes.items())
+            )
+            + "\n  the wheelhouse is the source of the lock, so start from an "
+            "empty one or remove the version that is not wanted"
+        )
+
     lines = []
     for (name, version), digest in sorted(entries):
         lines.append(f"{name}=={version} \\\n    --hash=sha256:{digest}")
