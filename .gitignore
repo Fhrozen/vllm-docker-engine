@@ -225,3 +225,12 @@ extra_repos/
 
 vllm-omni
 vllm-omni/
+
+# Build artifacts of this repo's own packaging engine.
+#   Everything under out/ is generated: staged packages, deterministic archives,
+#   wheelhouses, and generated locks. Rule files live in packaging/rules/ and ARE
+#   committed, so the ignore below must not reach them.
+#   Note *.so is already ignored above, which is why packages are verified by
+#   manifest hash rather than by committing their contents.
+out/
+!.gitkeep

@@ -1,1 +1,22 @@
+# The build context is assembled by docker/build.sh from an allow-list. This
+# file is the second line of defence for a plain `docker build .`: the read-only
+# clones must never reach an image, and generated artifacts must not either.
+.git/
+out/
+extra_repos/
+vllm/
+vllm-omni/
+.vscode/
+.github/
+docs/
+Plan.md
+memory.md
+wiki.md
+README.md
+LICENSE
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
 
