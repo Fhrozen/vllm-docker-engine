@@ -7,8 +7,10 @@ a wheelhouse. Installation is isolated and fully pinned:
               --require-hashes --no-deps --only-binary=:all: -r <lock>
 
 Nothing is resolved, nothing is downloaded at install time, and every wheel is
-hash-checked. After install the tree is pruned with the same rule as the engine
-variant, so the two variants are directly comparable (`tools/compare_packaging.py`).
+hash-checked. The wheelhouse is the only install source (`--no-index`), so a
+missing wheel fails loudly instead of quietly reaching the network. After install
+the tree is pruned with the same rule as the engine variant, so the two variants
+are directly comparable (`tools/compare_packaging.py`).
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ INSTALL_FLAGS = [
     "--require-hashes",
     "--no-deps",
     "--only-binary=:all:",
+    "--no-index",
 ]
 
 LOCK_LINE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s\\]+)")
@@ -55,7 +58,7 @@ def site_packages(venv: Path) -> Path:
     raise SystemExit(f"no site-packages under {venv}")
 
 
-def install_locked(lock: Path, wheelhouse: Path, venv: Path) -> None:
+def install_locked(lock: Path, wheelhouse: Path, venv: Path, rule: dict) -> None:
     if not lock.exists():
         raise SystemExit(
             f"lockfile not found: {lock} (generate it with packaging/lock.py)"
@@ -67,14 +70,23 @@ def install_locked(lock: Path, wheelhouse: Path, venv: Path) -> None:
         subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
         python = venv / "bin" / "python"
     subprocess.run(
-        [str(python), "-m", "pip", "install", *INSTALL_FLAGS,
-         "--find-links", str(wheelhouse), "-r", str(lock)],
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            *INSTALL_FLAGS,
+            "--find-links",
+            str(wheelhouse),
+            "-r",
+            str(lock),
+        ],
         check=True,
     )
     problems = pip_check(venv)
     if problems:
         raise SystemExit("pip check:\n  " + "\n  ".join(problems))
-    gate = lock_diff(venv, lock)
+    gate = lock_diff(venv, lock, rule)
     if gate:
         raise SystemExit("lock diff:\n  " + "\n  ".join(gate))
 
@@ -95,16 +107,26 @@ def installed_names(venv: Path) -> set[str]:
     return {rules_mod.norm(path.name.split("-")[0]) for path in dists}
 
 
-def lock_diff(venv: Path, lock: Path) -> list[str]:
+def lock_diff(venv: Path, lock: Path, rule: dict) -> list[str]:
     """Every lock entry must be present, and nothing may be installed outside
-    the lock."""
+    the lock.
+
+    The environment's own tooling (pip) is denied by the rule and never reaches
+    the payload, so it is reported as ignored rather than as a violation.
+    """
     want = {name for name, _ in lock_names(lock)}
     have = installed_names(venv)
     problems = []
+    ignored = []
     for name in sorted(want - have):
         problems.append(f"missing: {name}")
     for name in sorted(have - want):
+        if rules_mod.denied(name, rule):
+            ignored.append(name)
+            continue
         problems.append(f"installed outside the lock: {name}")
+    if ignored:
+        print("lock diff: ignored (denied by the rule): " + ", ".join(ignored))
     return problems
 
 
@@ -140,7 +162,7 @@ def build(
     venv = out / (rule["name"] + ".venv")
     if venv.exists():
         raise SystemExit(f"refusing to reuse an existing environment: {venv}")
-    install_locked(lock, wheelhouse, venv)
+    install_locked(lock, wheelhouse, venv, rule)
 
     tree = site_packages(venv)
     dropped = drop_build_path_launchers(venv, wheelhouse)
@@ -170,7 +192,7 @@ def main() -> int:
     args = ap.parse_args()
 
     rule = rules_mod.load(args.rule)
-    archs = arch_mod.parse(args.arch) if args.arch else arch_mod.detect()[0]
+    archs = arch_mod.resolve(args.arch)
     build(Path(args.lock), Path(args.wheelhouse), Path(args.out), rule, archs)
     return 0
 

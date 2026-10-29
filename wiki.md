@@ -31,6 +31,10 @@ This repo owns only: `packaging/`, `docker/`, `tools/`, `docs/`, and the root fi
 8. **No claim without a measurement.** Never write "bit-identical", "deterministic", "X MB", or
    "faster" without the run that produced it. Record numbers in `docs/SIZES.md` and `memory.md`.
 9. **GPU only.** No CPU-only lane. A CPU dual-run is not a deliverable.
+10. **Nothing executes on the host.** `docker/run.sh` is the only host-side entry point and it
+    issues only `docker build` / `docker run`. Every gate, test, measurement and script runs inside
+    the pinned tools container (`docker/Dockerfile.tools`). Content may move between images; project
+    code never runs in the local shell.
 
 ## Layout
 
@@ -42,10 +46,14 @@ packaging/     this repo's own engine (stdlib only, no third-party imports)
   libdeps.py   ELF DT_NEEDED closure, system/driver classification, uncovered gate
   lock.py      hash-pinned lock generation + --check (generated into out/, not committed)
   arch.py      CUDA arch detection by command
-docker/        Dockerfile.vllm, Dockerfile.omni, build.sh, entrypoint.sh,
-               healthcheck.sh, smoke-test.sh, docker-compose.yaml
-tools/         check_image_size.py, compare_packaging.py, measure.sh,
-               check_dist_gate.py, spike_torch_distributed.sh
+docker/        Dockerfile.vllm, Dockerfile.omni, Dockerfile.tools (pinned gate/test
+               container), run.sh (the only host-side entry point), gates.sh,
+               build.sh, entrypoint.sh, healthcheck.sh, smoke-test.sh,
+               docker-compose.yaml
+tools/         check_image_size.py, check_runtime_image.py, check_files.py,
+               compare_packaging.py, measure.sh, check_dist_gate.py,
+               spike_torch_distributed.sh
+tests/         conftest.py, test_packaging.py — behaviour tests for the engine
 docs/          PACKAGING.md, DOCKER.md, SIZES.md
 out/           generated packages, wheelhouse, locks, harness results (gitignored)
 ```
@@ -81,8 +89,14 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 
 ## Environment facts (this host)
 
-- Docker Hub pulls previously failed (401). Local `vllm/vllm-openai:latest` works. Its entrypoint is
-  `vllm serve`, so `--entrypoint bash` is required for anything else.
+- Docker Hub pulls work (`python:3.12-slim`, `node:22-slim`). Local `vllm/vllm-openai:latest` works
+  too. Its entrypoint is `vllm serve`, so `--entrypoint bash` is required for anything else.
+- The tools container has `bash`, `ruff`, `typos`, `markdownlint-cli2`, `shellcheck`, `git`,
+  `docker-cli`, `pyyaml`, `pytest`, `strip` (binutils) and PyPI access. `apt` works after
+  `apt-get update`.
+- `--gpus` must not be quoted: `--gpus '"device=0"'` breaks the daemon. Pass it unquoted
+  (`--gpus ${VDE_GPUS:-device=0}`), with a shellcheck disable since a directive inside a `\`
+  continuation is a parse error.
 - Container-created `.venv` is not usable from the host. Host has no `pip`, no `python` (only
   `python3`), no `pre-commit`, no `shellcheck`, no `git` inside the container.
 - Gate tools run pinned: `uvx ruff@0.14.10 --no-cache`, `uvx typos@1.49.0`,
@@ -95,6 +109,19 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   `tail -c 1 f | od -An -c`.
 - `tail -N` on a long pytest run hides failure detail. Redirect to a log file and grep for the
   short test summary plus the exception lines.
+- `pip download --platform` does not widen a request across manylinux revisions, and
+  `--abi cp312` hides `abi3` wheels. A single pinned tag cannot resolve a real requirement
+  set (`blake3` publishes only `manylinux_2_17`; `triton` is `cp312-abi3`). Resolve inside
+  the target environment and enforce the target by reading tags back out of the wheel
+  filenames.
+- pip spells the target flags with hyphens: `--python_version` is not an option.
+- git refuses a bind-mounted repo as "dubious ownership". Configure it through
+  `GIT_CONFIG_COUNT`/`safe.directory` rather than writing config into the workspace.
+- The docker CLI resolves paths in its own filesystem. Inside the tools container the build
+  context is `/workspace/out/context`; the daemon receives a tar, never a host path.
+- `HEALTHCHECK` requires `CMD`.
+- `--arch auto` is what the rules declare, so the CLI must read it as detection instead of
+  handing it to `normalise()`.
 
 ## Tool-usage notes
 
@@ -109,6 +136,11 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 
 ## Testing
 
+- Run tests through the container: `bash docker/run.sh test`. The suite writes only to `tmp_path`
+  and never reaches the network; ELF tests copy a real system `.so` into `tmp_path` and skip when
+  none is found, because a text fixture cannot stand in for an ELF file.
+- `tests/conftest.py` inserts `packaging/` and `tools/` into `sys.path`. Never `sys.path.append(".")`
+  from the repo root — `import tokenizers` then resolves to `vllm_omni/tokenizers`.
 - Offline pytest on this host (no `vllm` installed) needs fake package parents built with
   `types.ModuleType` + `__path__`, leaf modules loaded via
   `importlib.util.spec_from_file_location` (registered in `sys.modules` **before** `exec_module`),

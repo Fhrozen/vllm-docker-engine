@@ -20,17 +20,28 @@ This repo holds only the packaging and docker layer. `vllm/`, `vllm-omni/` and
 
 ```text
 packaging/    the packaging engine (rules, archs, ELF deps, archives)
-docker/       Dockerfiles, build script, entrypoint, healthcheck, compose
-tools/        size gate, packaging comparison, measurement, distributed spike
+docker/       Dockerfiles, run.sh (container entry point), gates, build script,
+              entrypoint, healthcheck, compose
+tools/        size gate, runtime gate, file checks, packaging comparison,
+              measurement, distributed spike
+tests/        behaviour tests for the packaging engine
 docs/         human and machine documentation
 out/          generated artifacts, not committed
 ```
 
-## Build and run
+## Build, test and run
+
+Everything runs inside a container. `docker/run.sh` is the only host-side entry
+point; it issues `docker build` and `docker run`, and nothing executes in the
+local shell.
 
 ```bash
-bash docker/build.sh --variant engine --tag vllm-slim:dev
-bash docker/build.sh --variant omni --tag vllm-omni-slim:dev
+bash docker/run.sh gate <changed files>   # pinned gates, files passed explicitly
+bash docker/run.sh test                   # behaviour tests for the engine
+bash docker/run.sh build --variant engine --tag vllm-slim:dev
+bash docker/run.sh size vllm-slim:dev
+bash docker/run.sh runtime vllm-slim:dev
+bash docker/run.sh measure vllm-slim:dev
 docker compose up vllm-slim
 ```
 

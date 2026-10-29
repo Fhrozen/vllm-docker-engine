@@ -9,7 +9,28 @@
   "python": "3.12",
   "requirements": {
     "clone": "vllm",
-    "files": ["requirements/common.txt", "requirements/cuda.txt"]
+    "files": ["requirements/common.txt", "requirements/cuda.txt"],
+    "names": [
+      "aiohttp", "anthropic", "apache-tvm-ffi", "blake3", "cachetools",
+      "cbor2", "cloudpickle", "compressed-tensors", "depyf", "einops",
+      "fastapi", "fastsafetensors", "filelock", "flashinfer-python",
+      "huggingface-hub", "humming-kernels", "ijson", "instanttensor",
+      "jsonschema", "lark", "llguidance", "lm-format-enforcer", "mcp",
+      "mistral-common", "model-hosting-container-standards", "msgspec",
+      "ninja", "numba", "numpy", "nvidia-cudnn-frontend",
+      "nvidia-cutlass-dsl", "nvtx", "openai", "opencv-python-headless",
+      "opentelemetry-api", "opentelemetry-exporter-otlp",
+      "opentelemetry-sdk", "opentelemetry-semantic-conventions-ai",
+      "oss-harmony", "outlines-core", "partial-json-parser", "pillow",
+      "prometheus-client", "prometheus-fastapi-instrumentator", "protobuf",
+      "psutil", "py-cpuinfo", "pybase64", "pydantic", "pynvvideocodec",
+      "python-json-logger", "pyyaml", "pyzmq", "quack-kernels", "regex",
+      "requests", "safetensors", "sentencepiece", "setproctitle",
+      "setuptools", "six", "starlette", "tiktoken", "tilelang",
+      "tokenizers", "tokenspeed-mla", "torch", "torchaudio", "torchcodec",
+      "torchvision", "tqdm", "transformers", "typing-extensions",
+      "watchfiles", "xgrammar"
+    ]
   },
   "allow": ["**"],
   "deny": [

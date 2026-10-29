@@ -43,18 +43,44 @@ SYSTEM_DIRS = ("/lib/", "/lib64/", "/usr/lib/", "/usr/lib64/")
 #: one is named in SYSTEM-LIBS.txt so a failure on a target machine can be
 #: traced to a package, not to a guess.
 SYSTEM_LIBS = (
-    "linux-vdso.so.1", "ld-linux-x86-64.so.2", "ld-linux-aarch64.so.1",
-    "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
-    "libutil.so.1", "libresolv.so.2", "libnss_*.so.*", "libgcc_s.so.1",
-    "libstdc++.so.6", "libgomp.so.1", "libatomic.so.1", "libz.so.1",
-    "libnuma.so.1", "libdrm.so.2", "libelf.so.1", "libtinfo.so.*",
-    "libcrypt.so.1", "libffi.so.*", "libpci.so.3", "libudev.so.1", "libdl",
+    "linux-vdso.so.1",
+    "ld-linux-x86-64.so.2",
+    "ld-linux-aarch64.so.1",
+    "libc.so.6",
+    "libm.so.6",
+    "libdl.so.2",
+    "libpthread.so.0",
+    "librt.so.1",
+    "libutil.so.1",
+    "libresolv.so.2",
+    "libnss_*.so.*",
+    "libgcc_s.so.1",
+    "libstdc++.so.6",
+    "libgomp.so.1",
+    "libatomic.so.1",
+    "libz.so.1",
+    "libnuma.so.1",
+    "libdrm.so.2",
+    "libelf.so.1",
+    "libtinfo.so.*",
+    "libcrypt.so.1",
+    "libffi.so.*",
+    "libpci.so.3",
+    "libudev.so.1",
+    "libdl",
 )
 
 #: From the GPU driver package: never redistributable, never bundled.
 DRIVER_LIBS = (
-    "libcuda.so.1", "libcuda.so", "libnvidia-*.so*", "libnvcuvid.so*", "libvulkan.so*",
-    "libGLX*.so*", "libEGL*.so*", "libOpenCL.so*", "libdrm_amdgpu.so*",
+    "libcuda.so.1",
+    "libcuda.so",
+    "libnvidia-*.so*",
+    "libnvcuvid.so*",
+    "libvulkan.so*",
+    "libGLX*.so*",
+    "libEGL*.so*",
+    "libOpenCL.so*",
+    "libdrm_amdgpu.so*",
 )
 
 LDD_LINE = re.compile(r"^\s*(\S+)\s+=>\s+(\S+)\s+\(0x")
@@ -85,14 +111,14 @@ def _dyn_strings(path: Path) -> tuple[list[tuple[int, int]], int, bytes]:
     is64 = data[4] == 2
     le = "<" if data[5] == 1 else ">"
     if is64:
-        shoff, = struct.unpack_from(le + "Q", data, 0x28)
+        (shoff,) = struct.unpack_from(le + "Q", data, 0x28)
         shentsize, shnum = struct.unpack_from(le + "HH", data, 0x3A)
     else:
-        shoff, = struct.unpack_from(le + "I", data, 0x20)
+        (shoff,) = struct.unpack_from(le + "I", data, 0x20)
         shentsize, shnum = struct.unpack_from(le + "HH", data, 0x2E)
     for i in range(shnum):
         base = shoff + i * shentsize
-        stype, = struct.unpack_from(le + "I", data, base + 4)
+        (stype,) = struct.unpack_from(le + "I", data, base + 4)
         if stype != SHT_DYNAMIC:
             continue
         if is64:
@@ -284,9 +310,7 @@ def write_system_libs(folder: Path, files: list[str]) -> list[str]:
         "",
     ]
     lines += sorted(needed)
-    (folder / SYSTEM_LIBS_FILE).write_text(
-        "\n".join(lines) + "\n", encoding="utf-8"
-    )
+    (folder / SYSTEM_LIBS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return sorted(needed)
 
 

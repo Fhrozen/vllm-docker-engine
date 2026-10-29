@@ -10,7 +10,15 @@
   "overlay_on": "vllm-slim",
   "requirements": {
     "clone": "vllm-omni",
-    "files": ["requirements/common.txt", "requirements/cuda.txt"]
+    "files": ["requirements/common.txt", "requirements/cuda.txt"],
+    "names": [
+      "accelerate", "aenum", "av", "cache-dit", "cosmos-guardrail",
+      "diffusers", "einops", "gguf", "imageio", "janus", "kernels",
+      "msgpack", "omegaconf", "onnxruntime", "openai-whisper", "prettytable",
+      "pydantic", "pydantic-settings", "pyzmq", "s3tokenizer", "safetensors",
+      "scipy", "soundfile", "soxr", "torchsde", "tqdm", "transformers",
+      "typing-extensions", "x-transformers"
+    ]
   },
   "allow": ["vllm_omni/**", "*.dist-info/**"],
   "deny": [

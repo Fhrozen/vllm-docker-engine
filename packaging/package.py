@@ -395,7 +395,7 @@ def main() -> int:
         return 1 if problems else 0
 
     rule = rules_mod.load(args.rule or "vllm")
-    archs = arch_mod.parse(args.arch) if args.arch else arch_mod.detect()[0]
+    archs = arch_mod.resolve(args.arch)
 
     if args.verify:
         pkg = Path(args.src)

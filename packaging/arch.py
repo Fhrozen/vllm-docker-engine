@@ -74,7 +74,10 @@ def detect() -> tuple[list[str], str]:
         try:
             done = subprocess.run(
                 ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=20, check=False,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
             )
             lines = done.stdout.splitlines()
             caps = [normalise(line) for line in lines if line.strip()]
@@ -84,6 +87,18 @@ def detect() -> tuple[list[str], str]:
             pass
 
     return list(FULL_LIST), "fallback"
+
+
+def resolve(value: str | None) -> list[str]:
+    """Architectures for a command-line value.
+
+    `auto` is what the rules declare (`arch_filter: auto`) and what the build
+    passes by default, so it has to mean detection here rather than be fed to
+    `normalise()`, which would reject it as an unreadable architecture.
+    """
+    if not value or value.strip().lower() == "auto":
+        return detect()[0]
+    return parse(value)
 
 
 def arch_of(name: str) -> str | None:
