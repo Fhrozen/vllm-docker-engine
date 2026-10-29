@@ -149,8 +149,10 @@ def main() -> int:
         shown = human(compressed) if compressed else "UNVERIFIED"
         print(f"compressed download: {shown} ({how})")
         if report["baseline"]:
-            print(f"baseline: {human(report['baseline']['unpacked_bytes'])} "
-                  f"({report['baseline']['image']})")
+            print(
+                f"baseline: {human(report['baseline']['unpacked_bytes'])} "
+                f"({report['baseline']['image']})"
+            )
             print(f"reduction: {report['reduction']}%")
         print(f"top {args.top} files:")
         for row in report["top_files"]:

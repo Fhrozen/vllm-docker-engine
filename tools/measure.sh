@@ -44,9 +44,10 @@ fi
 
 # --entrypoint is overridden because the image ENTRYPOINT is the server itself;
 # the harness needs to control startup timing and run the smoke test separately.
+# shellcheck disable=SC2086  # --gpus must not be quoted; quoting breaks the daemon
 docker run -d \
     --name "$NAME" \
-    --gpus ${VDE_GPUS:-device=0} \
+    --gpus ${GPUS} \
     --shm-size 1gb \
     --ipc host \
     -p "${PORT}:8000" \

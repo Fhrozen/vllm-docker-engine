@@ -32,6 +32,7 @@ CLONE = REPO / "vllm" / "vllm"
 # `if is_available():` guard and is therefore absent.
 STUB_PROVIDES = ("GroupName", "ProcessGroup")
 
+
 def module_level_imports(path: Path) -> list[str]:
     """Import statements at module scope, i.e. executed at import time."""
     tree = ast.parse(path.read_text(), filename=str(path))

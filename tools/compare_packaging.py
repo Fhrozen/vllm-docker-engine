@@ -51,7 +51,10 @@ def import_smoke(pkg: Path, module: str) -> str:
     env = dict(os.environ, PYTHONPATH=str(pkg))
     result = subprocess.run(
         [sys.executable, "-c", f"import {module}; print('ok')"],
-        capture_output=True, text=True, check=False, env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
     )
     if result.returncode == 0:
         return "ok"
@@ -137,9 +140,14 @@ def main() -> int:
         for failure in failures:
             print(f"build failure: {failure}")
 
-    return 1 if failures or any(
-        r["gate_verify"] or r["gate_uncovered"] or r["gate_static"] for r in rows
-    ) else 0
+    return (
+        1
+        if failures
+        or any(
+            r["gate_verify"] or r["gate_uncovered"] or r["gate_static"] for r in rows
+        )
+        else 0
+    )
 
 
 if __name__ == "__main__":
