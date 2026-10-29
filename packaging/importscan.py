@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rules as rules_mod  # noqa: E402
 
-DIST_INFO_SUFFIX = ".dist-info"
+DIST_INFO_SUFFIX = rules_mod.DIST_INFO_SUFFIX
 
 
 def head(module: str) -> str:
@@ -72,7 +72,11 @@ def top_level_map(site_packages: Path) -> dict[str, str]:
         record = dist / "RECORD"
         if not record.exists():
             continue
-        name = rules_mod.norm(dist.name.split("-")[0])
+        # the dist-info folder is `<name>-<version>.dist-info`; drop the suffix
+        # then split at the last hyphen, so a distribution name containing a
+        # hyphen is not cut short
+        stem = dist.name[: -len(DIST_INFO_SUFFIX)]
+        name = rules_mod.norm(stem.rsplit("-", 1)[0])
         for line in record.read_text(encoding="utf-8", errors="replace").splitlines():
             first = line.split(",")[0].strip()
             if "/" not in first:

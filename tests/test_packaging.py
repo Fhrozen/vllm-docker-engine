@@ -19,6 +19,7 @@ from conftest import REPO, rule, tree
 import arch
 import check_dist_gate
 import check_files
+import evaluate_deny
 import importscan
 import libdeps
 import package
@@ -608,6 +609,133 @@ def test_scan_uses_the_selection_when_bytecode_removes_the_source(tmp_path):
     ) == [
         "shipped/x.py: imports flashinfer at module level, but flashinfer-python is denied"
     ]
+
+
+def test_evaluate_parse_findings_splits_a_gate_line():
+    line = (
+        "shipped/x.py: imports flashinfer at module level, "
+        "but flashinfer-python is denied"
+    )
+    assert evaluate_deny.parse_findings([line]) == [
+        ("shipped/x.py", "flashinfer", "flashinfer-python")
+    ]
+
+
+def test_evaluate_wheel_sizes_counts_one_distribution_in_the_wheelhouse(tmp_path):
+    wh = tmp_path / "wheelhouse"
+    wh.mkdir()
+    (wh / "flashinfer_python-0.6.6-py3-none-any.whl").write_bytes(b"x" * 100)
+    (wh / "flashinfer_python-0.6.6-cp312-cp312-linux_x86_64.whl").write_bytes(b"y" * 50)
+    (wh / "torch-2.5.0-cp312-cp312-linux_x86_64.whl").write_bytes(b"z" * 7)
+    assert evaluate_deny.wheel_sizes(wh, "flashinfer-python") == (150, 2)
+    assert evaluate_deny.wheel_sizes(wh, "torch") == (7, 1)
+    assert evaluate_deny.wheel_sizes(wh, "numpy") == (0, 0)
+
+
+def test_evaluate_tree_sizes_measures_a_distribution_tree_only(tmp_path):
+    sp = tmp_path / "site-packages"
+    (sp / "foo").mkdir(parents=True)
+    (sp / "foo" / "a.py").write_text("x" * 10)
+    (sp / "foo" / "b.so").write_bytes(b"y" * 20)
+    (sp / "foo" / "link.so").symlink_to(sp / "foo" / "b.so")
+    assert evaluate_deny.tree_sizes(sp, ["foo"]) == (30, 2)
+    assert evaluate_deny.tree_sizes(sp, ["absent"]) == (0, 0)
+
+
+def test_evaluate_materialise_writes_only_the_selection(tmp_path):
+    sp = tmp_path / "site-packages"
+    tree(sp, {"shipped/x.py": "import deniedpkg\n", "deniedpkg/y.py": "x = 1\n"})
+    r = rule(deny=["deniedpkg"])
+    selected = set(package.select(sp, r, ["sm_90"]))
+    view = evaluate_deny.materialise(sp, selected, tmp_path / "view")
+    assert (view / "shipped" / "x.py").is_file()
+    assert not (view / "deniedpkg").exists()
+
+
+def test_denied_uses_the_record_owner_when_the_import_name_differs(tmp_path):
+    sp = tmp_path / "site-packages"
+    tree(sp, {"flashinfer/x.py": "x = 1\n", "other/y.py": "y = 1\n"})
+    (sp / "flashinfer-python-0.2.dist-info").mkdir(parents=True)
+    (sp / "flashinfer-python-0.2.dist-info" / "RECORD").write_text(
+        "flashinfer/x.py,,\n"
+    )
+    r = rule(deny=["flashinfer-python"])
+    owner = importscan.top_level_map(sp)
+    # the folder name is not the distribution name, so a name-only check misses it
+    assert not rules.denied("flashinfer/x.py", r)
+    assert rules.denied("flashinfer/x.py", r, owner)
+    assert package.select(sp, r, ["sm_90"], owner) == ["other/y.py"]
+
+
+def test_evaluate_stops_on_a_declared_requirement_not_an_import(tmp_path):
+    sp = tmp_path / "site-packages"
+    tree(sp, {"flashinfer/x.py": "x = 1\n"})
+    assert evaluate_deny.is_top_level("flashinfer", sp, {})
+    assert evaluate_deny.is_top_level("numpy", sp, {"numpy": "numpy"})
+    message = "The 'huggingface-hub>=1.31.0,<3.0' distribution was not found"
+    assert not evaluate_deny.is_top_level(message.split(".")[0], sp, {})
+
+
+def test_evaluate_view_must_start_clean(tmp_path):
+    view = tmp_path / "view"
+    assert evaluate_deny.view_is_clean(view)
+    view.mkdir()
+    assert evaluate_deny.view_is_clean(view)
+    (view / "x.py").write_text("x = 1\n")
+    assert not evaluate_deny.view_is_clean(view)
+
+
+def test_evaluate_importers_by_top_names_the_denied_importer_of_a_shipped_tree(
+    tmp_path,
+):
+    sp = tmp_path / "site-packages"
+    tree(
+        sp,
+        {
+            "kept/x.py": "import helper\n",
+            "helper/y.py": "x = 1\n",
+            "gone/z.py": "import helper\n",
+        },
+    )
+    (sp / "kept-1.0.dist-info").mkdir(parents=True)
+    (sp / "kept-1.0.dist-info" / "RECORD").write_text("kept/x.py,,\n")
+    (sp / "helper-1.0.dist-info").mkdir(parents=True)
+    (sp / "helper-1.0.dist-info" / "RECORD").write_text("helper/y.py,,\n")
+    (sp / "gone-1.0.dist-info").mkdir(parents=True)
+    (sp / "gone-1.0.dist-info" / "RECORD").write_text("gone/z.py,,\n")
+    r = rule(deny=["gone"])
+    selected = set(package.select(sp, r, ["sm_90"]))
+    owner = importscan.top_level_map(sp)
+    importers = evaluate_deny.importers_by_top(sp, selected, owner)
+    assert importers["helper"] == {"kept"}
+    assert "gone" not in importers["helper"]
+
+
+def test_evaluate_run_import_records_the_first_trigger(tmp_path):
+    sp = tmp_path / "site-packages"
+    tree(sp, {"entrypkg/__init__.py": "import depmod\n", "depmod.py": "x = 1\n"})
+    result = evaluate_deny.run_import(sp, "entrypkg")
+    assert result["missing"] is None
+    assert result["error"] is None
+    assert result["ok"]["depmod"] == "entrypkg"
+
+
+def test_evaluate_run_import_separates_a_caught_import_from_an_executed_one(tmp_path):
+    sp = tmp_path / "site-packages"
+    guarded = "try:\n    import deniedpkg\nexcept ImportError:\n    deniedpkg = None\n"
+    tree(sp, {"entrypkg/__init__.py": guarded})
+    result = evaluate_deny.run_import(sp, "entrypkg")
+    assert result["missing"] is None
+    assert result["ok"].get("deniedpkg") is None
+    assert result["failed"]["deniedpkg"] == "entrypkg"
+
+
+def test_evaluate_run_import_names_the_module_that_stopped_the_entry_path(tmp_path):
+    sp = tmp_path / "site-packages"
+    tree(sp, {"entrypkg/__init__.py": "import deniedpkg\n"})
+    result = evaluate_deny.run_import(sp, "entrypkg")
+    assert result["missing"] == "deniedpkg"
+    assert result["failed"]["deniedpkg"] == "entrypkg"
 
 
 def test_requirements_without_snapshot_needs_the_clone():

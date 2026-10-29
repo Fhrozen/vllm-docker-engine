@@ -72,7 +72,21 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   --only-binary=:all: -r <lock>`, followed by `pip check` and a diff against the lock names.
 - Deterministic archive: `SOURCE_DATE_EPOCH`, sorted members, no symlinks, no hard links,
   `compresslevel=9`.
-- `strip --strip-debug` is an explicit pipeline step, not a side effect of the build.
+- `strip --strip-debug` is an explicit pipeline step, not a side effect of the build, so the pkg
+  stage installs binutils. Without the tool `strip_tree()` prints "strip: tool unavailable,
+  skipping" and the pipeline ships unstripped binaries.
+- A prune pattern is checked against the **full tree**, never against the selection: `select()`
+  already excludes pruned files, so checking the selection is circular and every pattern looks
+  dead. `fnmatch` is case-sensitive, so `nvidia/cusparseLt/**` never fired — the real folder is
+  `nvidia/cusparselt`.
+- `rules.matches()` takes a **list** of patterns. A bare string iterates characters and makes
+  every pattern match every file, which produced a false "no dead prune patterns" reading.
+- A prune can break the image when libtorch `DT_NEEDED`s the target. That is why
+  `nvidia/cusparselt` (452.0 MB) and `nvidia/cuda_cupti` (41.3 MB) cannot be pruned at all.
+- `arch_of()` requires the arch as a distinct token. Files whose arch is embedded inside the
+  name (hash-named cubins) cannot be arch-filtered, so that split has to be measured by hand.
+- The evaluation view must start clean. A reused view reports a package as reachable because an
+  earlier round put it back.
 - Forbidden suffixes in the shipped tree: `.a`, `.o`, `.cmake`, plus `pkgconfig/` and dev headers —
   except when the `.pyc`-only mode is *not* chosen, in which case `.py` is allowed by rule.
 

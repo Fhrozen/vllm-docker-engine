@@ -51,7 +51,12 @@ def sha256(path: Path) -> str:
             h.update(block)
 
 
-def select(src: Path, rule: dict, archs: list[str]) -> list[str]:
+def select(
+    src: Path,
+    rule: dict,
+    archs: list[str],
+    owner: dict[str, str] | None = None,
+) -> list[str]:
     """Relative paths that the rule wants, sorted, no symlinks, no statics."""
     picked: list[str] = []
     for path in sorted(src.rglob("*")):
@@ -60,7 +65,7 @@ def select(src: Path, rule: dict, archs: list[str]) -> list[str]:
         if not path.is_file():
             continue
         rel = path.relative_to(src).as_posix()
-        if rules_mod.denied(rel, rule) or rules_mod.pruned(rel, rule):
+        if rules_mod.denied(rel, rule, owner) or rules_mod.pruned(rel, rule):
             continue
         if not rules_mod.matches(rel, rule["allow"]):
             continue

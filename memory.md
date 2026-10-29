@@ -8,7 +8,7 @@ next action. Every number here must come from a run in this repo, not from an es
 | Phase | State | Notes |
 | --- | --- | --- |
 | 0 — files & plan | done | `Plan.md`, `memory.md`, `wiki.md`, `docs/`, agents |
-| 1 — package research | complete (research), pending measurement | findings folded into `Plan.md` |
+| 1 — package research | complete (research + measurement) | findings folded into `Plan.md`, numbers in `docs/SIZES.md` |
 | 2 — docker build spikes | not started | needs a runnable base image (Docker Hub pulls previously failed with 401; local `vllm/vllm-openai:latest` works) |
 | 3 — vLLM slim image | tooling written, gates + tests green in docker | `packaging/` + `docker/` are in place |
 | 3b — harness | tooling written, no measurements yet | `tools/measure.sh` |
@@ -36,6 +36,10 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | `test` (74 tests) | exit 1, 2 failed — `runtime_conflicts` resolved a file's owner from its first path segment instead of the `RECORD` map, so a package importing its own submodules counted as a conflict, and the first fixture had no `RECORD` for the denied dist |
 | `test` (76 tests) | exit 0, all passed after the ownership fix |
 | `test` (77 tests) | exit 0, all passed after the selection fix |
+| `test` (88 tests) | exit 0, all passed after the evaluation decisions |
+| `gate` on `docs/SIZES.md` `docs/PACKAGING.md` `docs/DOCKER.md` `packaging/rules/vllm.json` `docker/Dockerfile.vllm` `docker/run.sh` | clean |
+| GPU read through the harness (`bash docker/run.sh gpu`) | `NVIDIA GeForce RTX 3060`, compute cap 8.6 → `sm_86` |
+| evaluation run after the decisions | entry import completed in round 1, gate clean |
 | first build, hard gate | printed nothing: `bytecode: pyc-only` removes the `.py` files from the shipped tree, so `pkg.rglob("*.py")` found no files and the gate passed on an empty set. The scan now takes the selection (`package.select`) and reads the source tree, so the chosen files are scanned whichever form they ship in |
 | `gate` on `packaging/importscan.py` `packaging/package_thin.py` `tools/check_dist_gate.py` `tests/test_packaging.py` | clean |
 | `gate` on `docker/build.sh` | clean |
@@ -147,6 +151,69 @@ What the runs showed:
   scripts, `build_backend.py` — so those files are prune candidates rather than a
   reason to ship setuptools.
 
+### Evaluation (the measurement phase)
+
+Run inside the container: `bash docker/run.sh script tools/evaluate_deny.py
+--wheelhouse out/wheelhouse --venv out/eval-venv --rule vllm --view out/eval-view-5`.
+The view must be a path that does not exist yet — `out/eval-view*` already held
+views from earlier rounds, and a reused view reports a package as reachable
+because an earlier round put it back.
+
+What the runs measured:
+
+- Target GPU, read through the harness: `NVIDIA GeForce RTX 3060`, compute cap
+  8.6, so the arch is `sm_86`. The tools container has no GPU, so `arch.detect()`
+  there always returns the fallback full list; the `gpu` task in `docker/run.sh`
+  is what makes detection possible.
+- Selection: **51,514 files / 11,021.6 MB before decisions → 44,441 files /
+  9,986.6 MB after**. Wheelhouse 5,364.3 MB / 189 wheels = 48.7% of unpacked.
+  Top 18 files are 62.9% of the selection; the numbers are in `docs/SIZES.md`.
+- `flashinfer-cubin`: 1,114.8 MB unpacked / 267.7 MB compressed, 9,762 files, no
+  module-level importer, reached only through `importlib.util.find_spec`. Arch
+  split measured by hand (the cubin files are hash-named, so `arch_of()` cannot
+  see them): sm_100 937.0 MB, sm_103 127.3 MB, unmarked 50.5 MB — **zero sm_86
+  kernels**, so it is dead weight for this GPU and is now denied.
+- flashinfer itself cannot be pruned: imported at module level by 8 core files,
+  and its own tree has sm_80 0.9 MB but no sm_86 kernels plus 24.0 MB of JIT
+  source. On sm_86 it needs nvcc, which R01 forbids — so the wheel ships and the
+  JIT path is a runtime dependency, not a build-time one.
+- `.pyc` 258.0 MB vs `.py` 230.3 MB inside the selection: `bytecode: pyc-only`
+  costs **+27.7 MB**, kept for startup latency rather than for size.
+- JIT source inside the selection: 104.8 MB (`.cpp` 87.6, `.cc` 14.3). Unusable at
+  runtime under R01, so it is a candidate prune — not yet applied.
+- Dead prune patterns, checked against the **full tree** (72,495 files):
+  `nvidia/cusparseLt/**` and `nvidia/cupti/**` never fired. The real folders are
+  `nvidia/cusparselt` (452.0 MB) and `nvidia/cuda_cupti` (41.3 MB), and both are
+  `DT_NEEDED` by libtorch, so they cannot be pruned at all. Patterns removed.
+- Corrected libtorch win: **~692.8 MB** (cusparselt 452.0 + nvshmem 196.2 +
+  cupti 41.3 + cufile 3.3), not the earlier 100–250 MB — and only for a source
+  build, since the pip wheel ships those features enabled.
+- Entry-path names that must ship: `huggingface-hub` 6.8 MB and `setuptools`
+  7.5 MB. The declared half can execute — `transformers` requires
+  `huggingface-hub>=1.31.0,<3.0` and the entry path reads it through
+  `importlib.metadata`, so a denied name is not automatically optional.
+- Decisions applied to `packaging/rules/vllm.json`: denied `torchcodec`,
+  `pynvvideocodec`, `flashinfer-cubin`; shipped `torchvision`, `torchaudio`,
+  `sentencepiece`, `setuptools`, `huggingface-hub`, `flashinfer-python`; prune
+  `**/include/**`, `**/*.a`, `**/tests/**`, `**/*.pyi`, `**/*.pyx`,
+  `**/examples/**`, `nvidia/*/bin/**`, `nvidia/nvvm/**`; removed
+  `**/benchmarks/**` (the entry path reaches `vllm.benchmarks` through the CLI).
+- binutils added to the pkg stage of `docker/Dockerfile.vllm`, so `strip` is a
+  real step instead of printing "strip: tool unavailable, skipping". binutils
+  stays in stage 1; the runtime image is checked for `strip` by the R01 gate.
+
+Two false readings this phase, both corrected by re-running:
+
+- `rules_mod.matches(rel, pattern)` called with a bare string iterates
+  characters, so every pattern matched all 51,514 files and the dead-pattern
+  conclusion was wrong. Passing `[pat]` gave the correct split.
+- Checking prune patterns against the selection is circular (`select()` already
+  excludes pruned files, so every pattern trivially matches nothing). The check
+  must run against the full tree.
+
+Runs after the decisions: entry import completes in round 1 (gate clean),
+`test` 88 passed, `gate` clean on the 6 changed files.
+
 Other defects found and fixed by running:
 
 - pip spells the target flags with hyphens; `--python_version` is not an option.
@@ -203,8 +270,15 @@ Bugs the container run exposed:
 
 ## Next action
 
-1. `bash docker/run.sh build` — first real image build, then the size and runtime gates.
+1. `bash docker/run.sh build --variant engine` with the decisions applied — the
+   selection is now 44,441 files / 9,986.6 MB, so the build has to be re-run to
+   fill the size table in `docs/SIZES.md`.
 2. Baseline row: `bash docker/run.sh measure vllm/vllm-openai:latest`.
-3. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
+3. Decide the JIT source (104.8 MB): R01 forbids a compiler in the runtime image,
+   so the `.cpp`/`.cc` trees in the selection cannot be used there. Pruning them
+   is only safe if nothing on the entry path compiles at import time — flashinfer
+   is the case to check on the GPU, because on sm_86 it has no prebuilt kernels.
+4. Uncovered gate: the 14 plugin `DT_NEEDED` entries need a decision — prune the
+   plugin trees or declare `libgomp`/`libtbb`/RDMA/MPI as system libraries.
+5. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
    `bash docker/run.sh script tools/compare_packaging.py`.
-4. Write `docs/PACKAGING.md`, `docs/DOCKER.md`, `docs/SIZES.md` and the agents.

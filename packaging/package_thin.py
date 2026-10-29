@@ -205,10 +205,9 @@ def build(
 
     # The selection is the shipped set. Read it before the tree is rewritten:
     # a pyc-only rule removes the source files the scan needs to read.
-    selected = set(pkg_mod.select(tree, rule, archs))
-    hard = importscan.runtime_conflicts(
-        tree, rule, importscan.top_level_map(tree), selected
-    )
+    owner = importscan.top_level_map(tree)
+    selected = set(pkg_mod.select(tree, rule, archs, owner))
+    hard = importscan.runtime_conflicts(tree, rule, owner, selected)
     if hard:
         raise SystemExit(
             "denied name imported at module level by a shipped file:\n  "

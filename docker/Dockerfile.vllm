@@ -27,6 +27,15 @@ COPY packaging/ /pkg/packaging/
 #   thin   -- installs a hash-pinned lock into an isolated environment, then selects
 # The image records which route produced it, so a size number is attributable.
 
+# strip is a pipeline step, so the tool has to exist where the step runs.
+# binutils stays in stage 1: the runtime stage has no compiler or binutils
+# (R01), and `strip` is in the rule's forbidden_tools list, so the runtime
+# image is checked for it. Without this line strip_tree prints
+# "strip: tool unavailable, skipping" and the strip flag is not a real step.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends binutils \
+ && rm -rf /var/lib/apt/lists/*
+
 # Lock generation is a build-time step. Locks are generated artifacts, not
 # committed files: a lock is only meaningful together with the wheelhouse it
 # was hashed from.

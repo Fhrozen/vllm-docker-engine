@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
-"""Evaluate each denied name before a rule is changed.
+"""Evaluate what a rule denies, and what the entry path actually needs.
 
 Three questions per name, each answered by measurement rather than by reading
 the rule:
 
-  size   - compressed bytes in the wheelhouse, extracted bytes in the tree
-  reach  - is the name imported at module level from the serve path
-  prune  - can the importing files be pruned instead of shipping the package
+  size   - wheel bytes (compressed download) and tree bytes (what ships)
+  reach  - does a shipped file import it at module scope
+  run    - is it executed at import time on the entry path
 
-A name is required when a file on the serve path imports it at module scope:
-that file cannot be pruned without breaking the entry point. A name is prunable
-when importers exist but none of them is reached from the entry module.
+The runtime half is a real import of the entry module against the materialised
+selection, in a fresh interpreter per round. When the import stops, the module
+it stopped on is recorded, put back into the view, and the import is retried.
+The loop ends when the entry import succeeds, so the recorded names are the
+ones the entry path executes and therefore cannot be pruned. A name with static
+reach that the entry path never reaches is a candidate for pruning, not a
+proven prune: a feature path can still reach it later.
 
-Nothing here runs on the host: run it inside the container, e.g.
+Nothing here runs on the host. Run it inside the container, e.g.
 
   bash docker/run.sh script tools/evaluate_deny.py --wheelhouse out/wheelhouse \
       --venv out/eval-venv --rule vllm
@@ -21,6 +25,9 @@ Nothing here runs on the host: run it inside the container, e.g.
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
+import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -34,6 +41,34 @@ import package as pkg_mod  # noqa: E402
 import rules as rules_mod  # noqa: E402
 
 ENTRY_DEFAULT = "vllm.entrypoints.cli.main"
+MAX_ROUNDS = 40
+
+RUNNER = """
+import builtins, json, sys
+view, entry = sys.argv[1], sys.argv[2]
+sys.path.insert(0, view)
+real = builtins.__import__
+ok, failed = {}, {}
+def hook(name, globals=None, *a, **k):
+    top = name.split(".")[0]
+    caller = (globals or {}).get("__name__", "<entry>")
+    try:
+        module = real(name, globals, *a, **k)
+    except ImportError:
+        failed.setdefault(top, caller)
+        raise
+    ok.setdefault(top, caller)
+    return module
+builtins.__import__ = hook
+missing, error = None, None
+try:
+    __import__(entry)
+except ModuleNotFoundError as exc:
+    missing = exc.name
+except Exception as exc:
+    error = f"{type(exc).__name__}: {exc}"
+print(json.dumps({"missing": missing, "error": error, "ok": ok, "failed": failed}))
+"""
 
 
 def wheel_sizes(wheelhouse: Path, dist: str) -> tuple[int, int]:
@@ -47,7 +82,7 @@ def wheel_sizes(wheelhouse: Path, dist: str) -> tuple[int, int]:
     return total, count
 
 
-def extracted_sizes(tree: Path, top_levels: list[str]) -> tuple[int, int]:
+def tree_sizes(tree: Path, top_levels: list[str]) -> tuple[int, int]:
     """Bytes and file count of a distribution's own files in the installed tree."""
     total = 0
     count = 0
@@ -62,49 +97,98 @@ def extracted_sizes(tree: Path, top_levels: list[str]) -> tuple[int, int]:
     return total, count
 
 
-def module_file(tree: Path, module: str, selected: set[str]) -> str | None:
-    """Resolve a dotted module to a shipped file, honouring the selection."""
-    parts = module.split(".")
-    for rel in ("/".join(parts) + ".py", "/".join(parts) + "/__init__.py"):
-        if rel in selected:
-            return rel
-    return None
-
-
-def serve_closure(tree: Path, selected: set[str], entry: str) -> dict[str, str]:
-    """Module-level import closure from the entry module, as child -> parent."""
-    start = module_file(tree, entry, selected)
-    if start is None:
-        raise SystemExit(f"entry module is not in the selection: {entry}")
-    parent = {start: ""}
-    queue = [start]
-    while queue:
-        rel = queue.pop(0)
-        for module in importscan.module_level_modules(tree / rel):
-            child = module_file(tree, module, selected)
-            if child is None or child in parent:
-                continue
-            parent[child] = rel
-            queue.append(child)
-    return parent
-
-
-def chain(parent: dict[str, str], target: str) -> str:
-    path = [target]
-    while parent.get(path[0]):
-        path.append(parent[path[0]])
-    return " -> ".join(reversed(path))
+def sum_sizes(tree: Path, selected: set[str]) -> int:
+    """Bytes of the selection only, which is what the image actually carries."""
+    return sum((tree / rel).stat().st_size for rel in selected)
 
 
 def parse_findings(findings: list[str]) -> list[tuple[str, str, str]]:
     """(file, module, denied dist) from the gate's finding lines."""
     rows = []
     for line in findings:
-        rel, rest = line.split(": ", 1)
-        module = rest.split(" at module level")[0].split(" imports ")[1]
-        dist = rest.split(" but ")[1].split(" is denied")[0]
-        rows.append((rel, module, dist))
+        rel, rest = line.split(": imports ", 1)
+        module, tail = rest.split(" at module level, but ", 1)
+        rows.append((rel, module, tail.split(" is denied")[0]))
     return rows
+
+
+def is_top_level(name: str, tree: Path, owner: dict[str, str]) -> bool:
+    """Whether a failing name is a package folder in the tree.
+
+    A shipped package can also fail on a declared requirement checked through
+    `importlib.metadata`; that is not an import, so the loop must not treat the
+    message as a folder name.
+    """
+    return name in owner or (tree / name).is_dir()
+
+
+def view_is_clean(view: Path) -> bool:
+    """A view must start empty.
+
+    Earlier rounds put folders back into the view, so a reused view answers for
+    files the selection does not carry, and the entry import can look complete
+    when the shipped image would fail.
+    """
+    return not view.exists() or not any(view.rglob("*"))
+
+
+def materialise(tree: Path, selected: set[str], dest: Path) -> Path:
+    """Write the selection to a view directory, so the import sees the shipped files."""
+    for rel in sorted(selected):
+        src = tree / rel
+        if not src.is_file() or src.is_symlink():
+            continue
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+    return dest
+
+
+def add_top(tree: Path, dest: Path, top: str) -> None:
+    """Put one top-level folder back into the view for the next round."""
+    folder = tree / top
+    if not folder.is_dir():
+        return
+    for path in folder.rglob("*"):
+        if path.is_file() and not path.is_symlink():
+            target = dest / path.relative_to(tree)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+
+
+def importers_by_top(tree: Path, selected: set[str], owner: dict[str, str]) -> dict:
+    """Top-level -> the distributions that import it at module level, from the selection.
+
+    Only Python files in the selection are read, because that is what the image
+    carries. A tree with no importer here is not automatically prunable: a .so can
+    be pulled in by DT_NEEDED or ctypes rather than by an import statement.
+    """
+    importers: dict[str, set[str]] = defaultdict(set)
+    for rel in sorted(selected):
+        path = tree / rel
+        if path.suffix != ".py":
+            continue
+        source = owner.get(rel.split("/")[0], "?")
+        for module in importscan.module_level_modules(path):
+            importers[module.split(".")[0]].add(source)
+    return importers
+
+
+def run_import(view: Path, entry: str) -> dict:
+    """Import the entry module in a fresh interpreter against one view.
+
+    The entry import writes its own log lines to stdout, so the runner's answer
+    is read from the last line rather than the whole stream.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", RUNNER, str(view), entry],
+        capture_output=True,
+        text=True,
+    )
+    lines = [line for line in proc.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise SystemExit(f"runner failed: {proc.stderr.strip() or 'no output'}")
+    return json.loads(lines[-1])
 
 
 def main(argv: list[str]) -> int:
@@ -114,6 +198,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--rule", required=True)
     parser.add_argument("--entry", default=ENTRY_DEFAULT)
     parser.add_argument("--arch", default="auto")
+    parser.add_argument("--view", default=str(REPO / "out" / "eval-view"))
     args = parser.parse_args(argv)
 
     wheelhouse = Path(args.wheelhouse).resolve()
@@ -125,46 +210,124 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"site-packages not found: {tree}")
 
     rule = rules_mod.load(args.rule)
+    denied = {rules_mod.norm(name) for name in rule["deny"]}
     archs = arch_mod.resolve(args.arch)
-    selected = set(pkg_mod.select(tree, rule, archs))
     owner = importscan.top_level_map(tree)
-    parent = serve_closure(tree, selected, args.entry)
+    selected = set(pkg_mod.select(tree, rule, archs, owner))
 
-    rows = parse_findings(importscan.runtime_conflicts(tree, rule, owner, selected))
+    view = Path(args.view).resolve()
+    if not view_is_clean(view):
+        raise SystemExit(
+            f"view is not empty: {view} — pass a fresh --view, a reused view "
+            "answers for files the selection does not carry"
+        )
+    view.mkdir(parents=True, exist_ok=True)
+    materialise(tree, selected, view)
+
+    print(f"selection: {len(selected)} files, {sum_sizes(tree, selected) / 1e6:.1f} MB")
+    print(f"entry: {args.entry}")
+    print()
+
+    hit_denied: dict[str, str] = {}
+    hit_pruned: dict[str, str] = {}
+    result = {}
+    for round_no in range(1, MAX_ROUNDS + 1):
+        result = run_import(view, args.entry)
+        name = result["missing"]
+        if name is None:
+            print(f"round {round_no}: entry import completed")
+            break
+        top = name.split(".")[0]
+        dist = owner.get(top, "?")
+        trigger = result["failed"].get(top, "?")
+        if not is_top_level(top, tree, owner):
+            print(
+                f"round {round_no}: stopped on a declared requirement, not an "
+                f"import: {name}"
+            )
+            break
+        if dist in denied:
+            hit_denied[dist] = trigger
+            print(
+                f"round {round_no}: stopped on {name} ({dist}, denied), via {trigger}"
+            )
+        else:
+            hit_pruned[name] = trigger
+            print(
+                f"round {round_no}: stopped on {name} ({dist}, not denied), via {trigger}"
+            )
+        add_top(tree, view, top)
+    else:
+        raise SystemExit(f"entry import did not complete in {MAX_ROUNDS} rounds")
+
+    if result["error"]:
+        print(f"entry import raised after the missing names: {result['error']}")
+
+    executed = {rules_mod.norm(top): top for top in result["ok"]}
+    attempted = {rules_mod.norm(top): top for top in result["failed"]}
+    findings = parse_findings(importscan.runtime_conflicts(tree, rule, owner, selected))
     by_dist: dict[str, list[tuple[str, str]]] = defaultdict(list)
-    for rel, module, dist in rows:
+    for rel, module, dist in findings:
         by_dist[dist].append((rel, module))
 
-    print(f"selection: {len(selected)} files, serve closure: {len(parent)} files")
     print()
-    for dist in sorted(rule["deny"]):
+    print("denied names, measured:")
+    for dist in sorted(denied):
         comp, wheels = wheel_sizes(wheelhouse, dist)
         tops = [top for top, own in owner.items() if own == dist]
-        disk, files = extracted_sizes(tree, tops)
-        found = by_dist.get(dist, [])
-        owners = defaultdict(int)
-        for rel, _ in found:
-            owners[rel.split("/")[0]] += 1
-        reached = [rel for rel, _ in found if rel in parent]
-        if not found:
-            verdict = "no module-level importer"
-        elif reached:
-            verdict = "required (imported on the serve path)"
+        disk, files = tree_sizes(tree, tops)
+        rows = by_dist.get(dist, [])
+        if dist in hit_denied:
+            verdict = (
+                f"executed at import time, cannot be pruned (via {hit_denied[dist]})"
+            )
+        elif dist in executed:
+            verdict = (
+                f"executed at import time (via {result['ok'].get(executed[dist], '?')})"
+            )
+        elif dist in attempted:
+            verdict = (
+                "attempted at import time, caught by the importing file "
+                f"(via {result['failed'].get(attempted[dist], '?')})"
+            )
         else:
-            verdict = "prunable (importers exist, none reached)"
-        print(f"{dist}: {verdict}")
+            verdict = "not executed by the entry import"
+        print(f"  {dist}: {verdict}")
         print(
-            f"  size: wheel {comp / 1e6:.1f} MB ({wheels} wheel(s)), "
+            f"    size: wheel {comp / 1e6:.1f} MB ({wheels} wheel(s)), "
             f"tree {disk / 1e6:.1f} MB ({files} files)"
         )
+        owners = defaultdict(int)
+        for rel, _ in rows:
+            owners[rel.split("/")[0]] += 1
         print(
-            f"  importers: {len(found)} files, by owner {dict(sorted(owners.items()))}"
+            f"    module-level importers: {len(rows)} files, {dict(sorted(owners.items()))}"
         )
-        if reached:
-            print(f"  serve path: {chain(parent, reached[0])}")
-        elif found:
-            print(f"  first importer (not reached): {found[0][0]}")
-        print()
+
+    print()
+    print("pruned paths the entry import reached:")
+    for name, trigger in sorted(hit_pruned.items()):
+        dist = owner.get(name.split(".")[0], "?")
+        print(f"  {name} ({dist}), via {trigger}")
+
+    print()
+    print("largest trees in the selection:")
+    importers = importers_by_top(tree, selected, owner)
+    sizes = defaultdict(int)
+    for rel in selected:
+        sizes[rel.split("/")[0]] += (tree / rel).stat().st_size
+    for top, size in sorted(sizes.items(), key=lambda x: -x[1])[:20]:
+        dist = owner.get(top, "?")
+        who = importers.get(top, set())
+        if rules_mod.norm(dist) in executed:
+            flag = "executed at import time"
+        elif not who:
+            flag = "no module-level importer in the selection"
+        elif all(rules_mod.norm(w) in denied for w in who):
+            flag = f"imported only by denied: {sorted(who)}"
+        else:
+            flag = f"imported by {sorted(who)}"
+        print(f"  {top}: {size / 1e6:.1f} MB ({dist}, {flag})")
     return 0
 
 

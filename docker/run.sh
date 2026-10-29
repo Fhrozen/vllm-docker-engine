@@ -134,6 +134,11 @@ case "$TASK" in
             --entrypoint bash \
             "$SPIKE_IMAGE" -c "bash $WORKDIR/tools/spike_torch_distributed.sh $*"
         ;;
+    gpu)
+        # A command in the tools container with a GPU attached, for arch detection.
+        # shellcheck disable=SC2086
+        run_gpu bash -c "$*"
+        ;;
     shell)
         ensure_tools
         docker run --rm -it \
@@ -160,6 +165,7 @@ docker/run.sh <task> [args]
   measure <image>       cold start, tokens/s, peak GPU memory
   serve-smoke <image>   fixed-seed inference against a running container
   spike [variant]       libtorch build variants (CUDA devel container)
+  gpu "<command>"       run a command in the tools container with a GPU attached
   shell                 interactive shell inside the container
 
 Nothing in this script runs on the host interpreter.

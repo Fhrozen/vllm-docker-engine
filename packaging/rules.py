@@ -30,6 +30,7 @@ import re
 from pathlib import Path
 
 RULES_DIR = Path(__file__).resolve().parent / "rules"
+DIST_INFO_SUFFIX = ".dist-info"
 
 
 def norm(name: str) -> str:
@@ -79,10 +80,29 @@ def top_level(rel: str) -> str:
     return first
 
 
-def denied(rel: str, rule: dict) -> bool:
-    pkg = norm(top_level(rel))
+def denied(rel: str, rule: dict, owner: dict[str, str] | None = None) -> bool:
+    """Whether a file is excluded by the deny list.
+
+    Deny entries are distribution names. The first path segment is an import
+    name, and the two are not always the same (`flashinfer-python` installs
+    `flashinfer`, `opencv-python-headless` installs `cv2`). When the RECORD
+    owner map is given, a folder is denied when the distribution that owns it
+    is denied, which is what the deny list means.
+    """
+    top = top_level(rel)
     deny = {norm(pattern) for pattern in rule.get("deny", [])}
-    return pkg in deny or matches(pkg, list(rule.get("deny", [])))
+    if top.endswith(DIST_INFO_SUFFIX):
+        # a denied distribution ships nothing, its metadata included
+        stem = top[: -len(DIST_INFO_SUFFIX)]
+        return norm(stem.rsplit("-", 1)[0]) in deny
+    pkg = norm(top)
+    if pkg in deny or matches(pkg, list(rule.get("deny", []))):
+        return True
+    if owner:
+        dist = owner.get(top)
+        if dist and norm(dist) in deny:
+            return True
+    return False
 
 
 def pruned(rel: str, rule: dict) -> bool:

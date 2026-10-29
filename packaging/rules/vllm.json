@@ -34,12 +34,9 @@
   },
   "allow": ["**"],
   "deny": [
-    "torchvision",
-    "torchaudio",
     "torchcodec",
     "pynvvideocodec",
     "pip",
-    "setuptools",
     "wheel",
     "pkgconfig",
     "pre-commit",
@@ -52,11 +49,9 @@
     "cmake",
     "pybind11",
     "datasets",
-    "huggingface-hub",
     "soundfile",
-    "sentencepiece",
     "xformers",
-    "flashinfer-python"
+    "flashinfer-cubin"
   ],
   "prune": [
     "**/tests/**",
@@ -69,10 +64,7 @@
     "**/docs/**",
     "**/doc/**",
     "**/examples/**",
-    "**/benchmarks/**",
     "nvidia/*/bin/**",
-    "nvidia/cupti/**",
-    "nvidia/cusparseLt/**",
     "nvidia/nvvm/**",
     "nvidia/*/nsight/**",
     "**/*.pyi",

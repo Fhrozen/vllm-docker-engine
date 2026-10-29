@@ -165,6 +165,48 @@ must ship — the rule has to change, not the build.
 unpacked. That is the point of the gate: a member is trusted only after its
 bytes match the manifest.
 
+## The evaluation
+
+`tools/evaluate_deny.py` answers three questions for each denied name, and each
+answer changes a rule:
+
+1. **Size** — wheel bytes in the wheelhouse, and tree bytes once installed.
+2. **Reach** — does a shipped file import it at module scope.
+3. **Run** — is it executed at import time on the entry path.
+
+Run inside the container, one interpreter per round, so a name that is executed
+is not confused with a name that is only imported:
+
+```bash
+bash docker/run.sh script tools/evaluate_deny.py \
+  --wheelhouse out/wheelhouse --venv out/eval-venv --rule vllm \
+  --view out/eval-view-5
+```
+
+The view must start clean. Earlier rounds put folders back into a reused view,
+so a reused view reports a package as reachable when the previous run restored
+it. `view_is_clean()` refuses a non-empty view for this reason.
+
+Two facts that only a run can give:
+
+- The declared half can execute. `transformers` declares
+  `huggingface-hub>=1.31.0,<3.0`, and the entry path reads that through
+  `importlib.metadata`, so a denied name is not automatically optional.
+- A prune pattern is checked against the real tree layout, not against the
+  selection. Checking the selection is circular: `select()` already excludes
+  pruned files, so every pattern trivially matches nothing. `fnmatch` is
+  case-sensitive, so `nvidia/cusparseLt/**` never fired — the real folder is
+  `nvidia/cusparselt`. Both that library and `nvidia/cuda_cupti` are
+  `DT_NEEDED` by libtorch, so they cannot be pruned at all: the uncovered gate
+  would fail.
+
+`arch_filter` cannot prune a file whose arch is embedded inside its name rather
+than a separate token. The flashinfer cubin files are hash-named, so the arch
+split had to be measured by hand before the package could be denied.
+
+The decisions the evaluation produced are in `packaging/rules/vllm.json`, and
+the numbers behind them are in `docs/SIZES.md`.
+
 ## Driver boundary
 
 `libcuda.so.1` and `libnvidia-*` are never bundled. The host driver provides
@@ -190,6 +232,11 @@ from an estimate:
   `new==0.1: wheel not in lock` for an extra wheel.
 - `check_files.py` refuses being called with no files: a gate that receives no
   arguments renders nothing and exits 0, which is not a pass.
+- `matches()` requires a list of patterns. Passing a bare string iterates
+  characters, which makes every pattern match every file — that produced a
+  false "no dead prune patterns" reading.
+- `requirements_for()` refuses a rule that denies its own package, and prints
+  how many requirement names the deny list removed from the download.
 - `lock_diff()` reports a package installed outside the lock, and ignores the
   environment's own tooling when the rule denies it (`pip` is never shipped).
 - `INSTALL_FLAGS` keeps the wheelhouse as the only install source
