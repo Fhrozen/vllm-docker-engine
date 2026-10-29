@@ -19,9 +19,12 @@ MiB.
 
 ## Phase 4 gate
 
-The omni overlay is only worth building if the engine image is **≤ 4 GB** and
-**≥ 60% smaller** than the baseline. Both conditions are checked by
-`tools/check_image_size.py`, and both must be measured numbers.
+The gate is an engine image **under 6 GB** and **≥ 60% smaller** than the
+baseline. 4 GB is kept as the **stretch goal**, so a `--budget 4GB` run is still
+a valid stricter measurement; `tools/check_image_size.py` reports the stretch
+separately from the gate. Both conditions must be measured numbers.
+
+The omni overlay is only worth building once the engine image passes the gate.
 
 "A tenth of the baseline" is not reachable for a GPU image: torch plus the
 NVIDIA runtime libraries are roughly a 2.5–3.5 GB floor before any vLLM code.
@@ -171,7 +174,7 @@ On disk / compressed download, from `docker image inspect` and
 | `nvidia/cuda:12.8.1-devel-ubuntu24.04` | 8.75 GB | 6.89 GB |
 | `python:3.12-slim` | — | 0.34 GB |
 
-A CUDA runtime base is over the 4 GB budget on its own, which is the strongest
+A CUDA runtime base is over the 4 GB stretch goal on its own, which is the strongest
 argument for a plain base plus pip wheels. Largest files in
 `12.8.1-runtime`: libcublasLt 716.9 MB, libcusparse 368.7 MB, libnccl 365.8 MB.
 
@@ -189,6 +192,21 @@ Duplicate tree: `nvidia_cutlass_dsl` ships `cu12/lib/libcute_dsl_runtime.so`
 (41.6 MB) and `cu13/lib/libcute_dsl_runtime.so` (41.6 MB). `CUDA_VERSION.major`
 resolves to 13 in this environment, so the cu12 copy is dead weight — open prune,
 pending the CUDA-version decision.
+
+Both branches of that prune were run against the real tree (rule `vllm`, arch
+`sm_86`):
+
+| Keep | Files | Tree MB | cutlass MB | Pruned MB |
+| --- | --- | --- | --- | --- |
+| cu12 | 48,672 | 10,736.2 | 462.6 | 43.7 |
+| cu13 | 48,672 | 10,736.3 | 462.7 | 43.6 |
+| no series | 48,673 | 10,779.9 | 506.3 | 0.0 |
+
+The branches are the same size, so the decision is which copy the loader
+resolves, not which is smaller. The mechanism is settled; the value it uses is
+still open, and it comes from the detection variables file (`out/cuda.env`).
+The rule's `system_libs` names are `.12` sonames, so they must change if the
+declared series becomes 13.
 
 ## What the measurements changed
 

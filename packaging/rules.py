@@ -14,6 +14,9 @@ A rule file is JSON. Keys:
   bytecode      — "source" or "pyc-only"
   strip         — run `strip --strip-debug` on ELF files as an explicit pipeline step
   arch_filter   — "auto" (detected by command) or a list of CUDA architectures
+  cuda_variant  — folder that ships one copy per CUDA series (e.g.
+                  nvidia_cutlass_dsl); copies of other series are pruned. The
+                  series is decided by command, never by a default in a Dockerfile
   system_libs   — sonames the distribution provides, recorded in SYSTEM-LIBS.txt
   driver_libs   — sonames the GPU driver provides, never bundled
   runtime_apt   — packages the runtime image installs
@@ -107,3 +110,21 @@ def denied(rel: str, rule: dict, owner: dict[str, str] | None = None) -> bool:
 
 def pruned(rel: str, rule: dict) -> bool:
     return matches(rel, rule.get("prune", []))
+
+
+def cuda_variant(rel: str, rule: dict, series: int | None) -> bool:
+    """Whether a file belongs to a CUDA series other than the declared one.
+
+    `nvidia_cutlass_dsl` ships a copy of the same runtime library for cu12 and
+    for cu13 (41.6 MB each), and the environment resolves one of them. The rule
+    names the folder; the series comes from detection, so the dead copy is
+    pruned by measurement rather than by assumption.
+    """
+    folder = rule.get("cuda_variant")
+    if not folder or series is None:
+        return False
+    parts = rel.split("/")
+    if parts[0] != folder or len(parts) < 2:
+        return False
+    match = re.fullmatch(r"cu(\d+)", parts[1])
+    return bool(match) and int(match.group(1)) != int(series)

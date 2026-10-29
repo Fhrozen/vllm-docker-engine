@@ -14,8 +14,10 @@ number. Findings so far are collected in `docs/findings.md`.
 ## Target
 
 - Deliverable: a **vLLM slim GPU image** (+ optional `vllm-omni` overlay image).
-- Baseline: official `vllm/vllm-openai`. Gate for the omni phase: **<= 4 GB AND >= 60% smaller**
-  than the baseline, measured on the same machine.
+- Baseline: official `vllm/vllm-openai`. Gate for the omni phase: **under 6 GB**
+  AND **>= 60% smaller** than the baseline, measured on the same machine. 4 GB is
+  kept as the **stretch goal**, so a stricter run (`--budget 4GB`) is still valid
+  and is reported separately from the gate.
 - A literal tenth is not reachable for a GPU image: torch + the `nvidia-*` runtime wheels are a
   ~2.5–3.5 GB floor. The honest ceiling is ~60–70% reduction. Say so when reporting.
 - `extra_repos/Strata` and `extra_repos/vllm.cpp` are **read-only reference clones**. Their
@@ -26,9 +28,21 @@ number. Findings so far are collected in `docs/findings.md`.
 
 - GPU runtime image only. No CPU-only lane.
 - Single CUDA arch, detected at build time by command (`packaging/arch.py`), `VDE_CUDA_ARCH` override.
+- **Personal/local images.** The CUDA version is decided from the installed environment by
+  command, not by a default in a Dockerfile: driver version and installed CUDA are read, stored
+  in a variables file (`out/cuda.env`), and used to select and generate the image. A shared
+  image is possible, but the plan targets images that work on a specific machine.
+  **A CUDA version the user sets wins over detection** (`--cuda` or `VDE_CUDA`).
+  The only condition on it is the installed driver: if the driver cannot run it,
+  the script raises an error naming the driver as the cause and says to use a
+  different CUDA version or update the driver.
 - Artifacts (locks, packages, archives) are generated at build time into `out/` (gitignored).
   Rules files are committed.
 - Measure **both** size and speed. Harness model: `Qwen/Qwen3.5-0.8B`.
+- **A 401 from a registry or package index is reported, not retried.** Source and
+  reason are printed, and the user is asked to check availability or download the
+  file directly. Nothing retries, changes credentials, or guesses an alternate
+  URL.
 - Both packaging variants are implemented (engine + thin) and compared; the comparison harness
   picks the default.
 - Both bytecode strategies are implemented (host-built archive vs `.pyc`-only ship) and measured.
@@ -81,6 +95,26 @@ number. Findings so far are collected in `docs/findings.md`.
    the registry. The default `12.8.1-devel-ubuntu24.04` is chosen because it
    matches the cu12 wheelhouse (torch 2.10.0 pins every `nvidia-*` dependency to
    cu12), not because 13.3 is unavailable.
+8. **The CUDA version comes from commands, and there are two different values.**
+   `packaging/cuda.py` reads the driver (`nvidia-smi`), the installed toolchain
+   (`nvcc --version`), the wheelhouse (the floor: a cu12 wheel cannot be relabelled
+   cu13) and the installed tree, then writes `out/cuda.env`, which `docker/build.sh`
+   sources. The **declared series** is what the package ships (12 here, from the
+   wheelhouse); the **copy that survives** is what the environment resolves (13 here,
+   from `nvidia_cutlass_dsl`). Both branches were run against the real tree: keeping
+   cu12 prunes 43.7 MB, keeping cu13 prunes 43.6 MB, keeping both prunes nothing
+   (506.3 MB of cutlass). The choice is not a size decision — it is which copy the
+   loader actually uses, so the surviving copy is the one the environment resolves.
+   The variables file is sourced by shell, so every value must be quoted: an
+   unquoted `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a command.
+   Details in `docs/findings.md`.
+9. **The 401 wording has one source.** `packaging/report.py` holds the sentence;
+   `docker/pull.sh` is the shell copy (a shell script cannot import the module),
+   and `tests/test_report.py` fails if the two drift. Measured in the container:
+   a fabricated 401 detail prints the sentence, an already-local image returns
+   without pulling, and a tag the registry refuses prints the failure without the
+   401 sentence and exits 1 (`nvidia/cuda:12.4.1-devel-ubuntu24.04`). A real
+   network 401 has not been observed since the rule was written.
 
 ## Phases
 

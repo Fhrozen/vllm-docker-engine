@@ -31,14 +31,36 @@ This repo owns only: `packaging/`, `docker/`, `tools/`, `docs/`, and the root fi
 8. **No claim without a measurement.** Never write "bit-identical", "deterministic", "X MB", or
    "faster" without the run that produced it. Record numbers in `docs/SIZES.md` and `memory.md`.
 9. **GPU only.** No CPU-only lane. A CPU dual-run is not a deliverable.
-10. **Nothing executes on the host.** `docker/run.sh` is the only host-side entry point and it
-    issues only `docker build` / `docker run`. Every gate, test, measurement and script runs inside
-    the pinned tools container (`docker/Dockerfile.tools`). Content may move between images; project
-    code never runs in the local shell.
-11. **This is an experimental research repo.** If a decision is not clear, evaluate both
-    options and select from the results. A decision stays open until both branches have
-    been run, and each branch records the command that produced its number. Open
-    decisions are listed in `docs/findings.md`.
+10. **Nothing executes on the host.** `docker/run.sh` is the only host-side entry
+    point and it issues only docker daemon commands (`build`, `run`, `pull`,
+    `images`). Every gate, test, measurement and script runs inside the pinned
+    tools container (`docker/Dockerfile.tools`). Content may move between images;
+    project code never runs in the local shell.
+11. **This is an experimental research repo.** If a decision is not clear, evaluate
+    both options and select from the results. A decision stays open until both
+    branches have been run, and each branch records the command that produced its
+    number. Open decisions are listed in `docs/findings.md`.
+12. **CUDA is decided by command, not by a default in a Dockerfile.** Driver version
+    and installed CUDA are read (`nvidia-smi`, `nvcc`), stored in a variables file
+    (`out/cuda.env`), and used to select and generate the image. Every value in that
+    file is single-quoted because `docker/run.sh` sources it: an unquoted line was
+    executed as a command (`VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` → `nvcc fatal :
+    Don't know what to do with 'PATH'`). The images built here are personal/local, so
+    the detected environment is the input — not a guess.
+    **A CUDA version the user sets wins over detection** (`--cuda`, `VDE_CUDA`);
+    the only condition on it is the installed driver. When the driver cannot run
+    the selected version, the script raises an error naming the driver as the
+    cause and tells the user to use a different CUDA version or update the driver.
+13. **A 401 is reported to the user, not retried.** A 401 from an image registry
+    or package index means the source may not be available, which a build cannot
+    fix by trying again. Nothing retries, changes credentials, or guesses an
+    alternate URL: the source and reason are printed, and the user is asked to
+    check availability or download the file directly. The wording lives in
+    `packaging/report.py`; `docker/pull.sh` is its shell copy, and a test fails
+    if the two drift.
+14. **The size target is under 6 GB.** 4 GB stays as the stretch goal, so a
+    stricter run is still valid. Reduction against the baseline is the secondary
+    condition.
 
 ## Layout
 
@@ -50,8 +72,11 @@ packaging/     this repo's own engine (stdlib only, no third-party imports)
   libdeps.py   ELF DT_NEEDED closure, system/driver classification, uncovered gate
   lock.py      hash-pinned lock generation + --check (generated into out/, not committed)
   arch.py      CUDA arch detection by command
+  report.py    the 401 rule in one place, so the same wording reaches the
+               download, the registry check and the run script
 docker/        Dockerfile.vllm, Dockerfile.omni, Dockerfile.tools (pinned gate/test
-               container), run.sh (the only host-side entry point), gates.sh,
+               container), run.sh (the only host-side entry point), pull.sh (the
+               shell copy of report.py), gates.sh,
                build.sh, entrypoint.sh, healthcheck.sh, smoke-test.sh,
                docker-compose.yaml
 tools/         check_image_size.py, check_runtime_image.py, check_files.py,
@@ -114,6 +139,20 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   covers the wheel folders), or the image needs a `ld.so.conf.d` entry plus `ldconfig`, or
   a RUNPATH rewrite at build time. `vllm/_C.abi3.so` has no RUNPATH of its own, so a direct
   `ctypes.CDLL` on it fails before torch is imported.
+- CUDA and arch values come from commands and are stored in a variables file
+  (`out/cuda.env`), never hardcoded as defaults. The file is **sourced by shell**, so every
+  value must be single-quoted — `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a
+  command before quoting was added. Detection order is override → command → fallback, and
+  each value records *how* it was decided, the same pattern `arch.py` uses.
+- There are **two** CUDA values and they are not the same: the series the wheelhouse
+  declares (12 for this rule) and the copy the environment resolves (13, from
+  `nvidia_cutlass_dsl/cuNN` and `CUDA_VERSION.major`). Both are recorded — `VDE_CUDA_SERIES`
+  for the declared series, `VDE_CUDA_KEEP` for the surviving copy — and the prune follows the
+  latter. `rules.cuda_variant()` prunes a folder's copies of other series; it returns False
+  when the rule has no `cuda_variant` key or no series is given.
+- `nvcc` is on the host but **not** in the tools container, so the installed-toolchain reading
+  must happen in a CUDA devel container (`spike-run`), not in the tools image. Inside the tools
+  container `packaging/cuda.py` reports `no nvcc on PATH`, which is the honest answer there.
 
 ## Docker conventions
 
@@ -128,12 +167,18 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 - The build context is assembled from an allow-list (`packaging/`, `docker/`, `tools/`) through
   `git ls-files --cached --others --exclude-standard`. Tracked files alone are not enough: a new
   file is silently absent from the context, and the build fails at its first import.
+- An image is checked before it is used: `docker/pull.sh` (`check_image`) returns straight away
+  when the image is already local, so a pull is not attempted for it. This matters because the
+  tools image is built on first use, and a base that cannot be pulled would fail every task.
+  `docker/pull.sh` is sourced by `docker/run.sh` and `docker/build.sh`; it is the shell copy of
+  `packaging/report.py`, and `tests/test_report.py` fails if the wording drifts.
 
 ## Running things
 
 `docker/run.sh` is the only host-side entry point. Tasks: `image`, `build`, `gate`, `test`,
 `script`, `py`, `dist`, `size`, `runtime`, `measure`, `serve-smoke`, `spike`, `spike-run`,
-`compile`, `gpu`, `shell`. Everything runs in the pinned tools container; `gpu` runs a command in
+`compile`, `gpu`, `cuda`, `pull`, `shell`. Everything runs in the pinned tools
+container; `gpu` runs a command in
 a GPU container because the tools container has no GPU, so arch detection there always falls back
 to the full list. `spike-run` and `compile` exist because the pinned tools image has no C
 compiler on purpose — triton builds a C extension at runtime, so a measurement that needs a
@@ -167,6 +212,11 @@ The dynamic view is the one that can prune; the static view is the one that can 
   different ruff version reformats differently than CI.
 - Ruff parses `.sh` as Python and reports invalid syntax. Never run ruff over shell files.
 - Project lint selects `UP` and `I` with `target-version = "py310"`.
+- MD013 (max 80) checks prose lines and table rows but **not fenced code blocks**.
+  Measured with a probe file: a prose line of 82 and a table row of 82 were
+  reported, an 85-character line inside a fenced block was not. So command
+  examples in fenced blocks may run long, and prose paragraphs must be wrapped
+  at word boundaries.
 - `grep -E '[ \t]+$'` is not a tab check (in ERE, `\t` is a literal backslash + `t`). Use `grep -P`
   or a Python byte check. `last=$(tail -c 1 f)` is always empty — check the final newline with
   `tail -c 1 f | od -An -c`.
@@ -204,6 +254,10 @@ The dynamic view is the one that can prune; the static view is the one that can 
   none is found, because a text fixture cannot stand in for an ELF file.
 - `tests/conftest.py` inserts `packaging/` and `tools/` into `sys.path`. Never `sys.path.append(".")`
   from the repo root — `import tokenizers` then resolves to `vllm_omni/tokenizers`.
+- Download and registry failures are tested without a network. `test_report.py`
+  checks the 401 wording, that a non-auth failure prints only the source and the
+  detail, and that the shell copy in `docker/pull.sh` still contains the same
+  sentence: the test reads the file and fails if the two drift.
 - Offline pytest on this host (no `vllm` installed) needs fake package parents built with
   `types.ModuleType` + `__path__`, leaf modules loaded via
   `importlib.util.spec_from_file_location` (registered in `sys.modules` **before** `exec_module`),

@@ -19,6 +19,14 @@ Gates enforce the rule mechanically: `tools/check_files.py` refuses to run with
 no files, and `tools/compare_packaging.py` only picks a default after both
 variants have been measured.
 
+Two rules came from the user during this phase and are now enforced in code:
+
+- A CUDA version the user sets wins over detection. The only condition on it is
+  the installed driver, and the error names the driver as the cause.
+- A 401 is reported, not retried. Nothing retries, changes credentials, or
+  guesses an alternate URL; the user is asked to check availability or download
+  the file directly.
+
 ## Is the CUDA base image required?
 
 Short answer: **no, not at runtime.** The value of `nvidia/cuda:*-base` is its
@@ -81,6 +89,49 @@ If the build stage is changed to a CUDA image at all, use the smallest one that
 has nvcc, and never the runtime or base variant for the final stage — see the
 size table in `docs/SIZES.md`.
 
+### The tag is read by command, not chosen by a default
+
+This package releases code for a personal/local image, so the CUDA version comes
+from the machine: driver version and installed CUDA are read by command, stored
+in `out/cuda.env`, and used to select and generate the builder tag. Detection
+order is override, then command, then fallback, and each value records how it was
+obtained.
+
+The order is override first, so a user value wins over the driver ceiling and
+over the wheelhouse, with one condition: the driver must be able to run it. Tests
+assert this: a user value above the ceiling raises an error that names the driver
+as the cause and says to use another CUDA version or update the driver. A value
+at or below the ceiling is accepted, and a value that disagrees with the
+wheelhouse is accepted with a note that the wheelhouse copy must be fetched.
+
+The reading has to happen in a CUDA devel container. `nvcc` is on the host but
+not in the tools container, so `packaging/cuda.py` reports `no nvcc on PATH`
+there; `bash docker/run.sh spike-run` is where the reading is done.
+
+The variables file is sourced by shell, so every value must be single-quoted.
+Measured failure: an unquoted `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was run as
+a command and the gate failed with `nvcc fatal : Don't know what to do with
+'PATH'`.
+
+### Two CUDA values, and they are not the same
+
+| Value | What it names | Measured here |
+| --- | --- | --- |
+| `VDE_CUDA_SERIES` | the series the wheelhouse declares | 12 |
+| `VDE_CUDA_KEEP` | the copy the environment resolves | 13 |
+
+The prune follows the latter. Both branches were run against the real tree (rule
+`vllm`, arch `sm_86`):
+
+| Keep | Files | Tree MB | cutlass MB | Pruned MB |
+| --- | --- | --- | --- | --- |
+| cu12 | 48,672 | 10,736.2 | 462.6 | 43.7 |
+| cu13 | 48,672 | 10,736.3 | 462.7 | 43.6 |
+| no series | 48,673 | 10,779.9 | 506.3 | 0.0 |
+
+The branches are the same size, so the decision is which copy the loader
+resolves, not which is smaller. With no series nothing is pruned.
+
 ## The duplicate cu12/cu13 tree
 
 `nvidia-cutlass-dsl` ships both `cu12/lib/libcute_dsl_runtime.so` and
@@ -93,8 +144,28 @@ Also open: the four stub `.so` files in that package are not ELF, which makes
 `strip` print "Unable to recognise the format". `strip` now skips non-ELF and
 foreign-arch files, so this is no longer a build failure.
 
+## When a download answers 401
+
+The wording lives in `packaging/report.py`, and `docker/pull.sh` is its shell copy
+because a shell script cannot import the module. `tests/test_report.py` reads the
+shell file and fails if the two copies drift.
+
+Measured runs in the container:
+
+| Run | Result |
+| --- | --- |
+| fabricated 401 detail | prints the source and asks the user |
+| `check_image` on a local image | returns without pulling |
+| `nvidia/cuda:12.4.1-devel-ubuntu24.04` | refused, no 401 sentence, exit 1 |
+
+A real network 401 has not been observed since the rule was written, so the
+reporting path is proven by the fabricated case and the local-image case only.
+
 ## Size facts that hold so far
 
+- The gate threshold is an image under 6 GB on disk, with 4 GB kept as the
+  stretch goal. `tools/check_image_size.py` reports the stretch separately from
+  the gate, so a `--budget 4GB` run is still valid.
 - The wheelhouse is 48.7% of the selected tree (5,364.3 MB of 10,505.7 MB).
 - The libraries the serving workload actually maps are 38 files / 5,798.9 MB,
   against 44,441 files / 9,986.6 MB selected — so most of the tree is never
@@ -117,4 +188,8 @@ Each of these is undecided by design and will be settled by running both sides.
 | CUDA version the image declares | driver ceiling (13.0) vs wheelhouse (cu12) |
 | `.pyc`-only or source ship | startup latency vs +27.7 MB |
 | Packaging variant | `tools/compare_packaging.py` after both are measured |
-| cutlass cu12 vs cu13 prune | which CUDA version the image declares |
+| cutlass cu12 vs cu13 prune | which copy the loader resolves, both measured |
+| CUDA version the image declares | read by command, ceiling vs wheelhouse |
+
+The cutlass decision is settled in mechanism and open in value: the choice is
+which copy the environment resolves, and both branches have been measured above.

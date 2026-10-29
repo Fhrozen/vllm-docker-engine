@@ -14,15 +14,30 @@
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# A pull that fails with 401 is reported to the user rather than retried, so the
+# wording lives in one shell helper that both this script and build.sh source.
+# shellcheck disable=SC1090
+. "$REPO/docker/pull.sh"
+
 TOOLS="${VDE_TOOLS_IMAGE:-vde-tools:dev}"
 CACHE="${VDE_CACHE_VOLUME:-vde-tools-cache}"
 SOCKET="${VDE_DOCKER_SOCKET:-/var/run/docker.sock}"
 WORKDIR="/workspace"
 GPUS="${VDE_GPUS:-device=0}"
+# The CUDA values come from the variables file that the `cuda` task writes, so a
+# personal image is built from what this machine actually has. The fallback below
+# is for a machine where no detection has run yet.
+CUDA_ENV="${VDE_CUDA_ENV:-$REPO/out/cuda.env}"
+if [ -f "$CUDA_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$CUDA_ENV"
+fi
+
 # 12.4.1-devel-ubuntu24.04 does not exist on the registry (manifest unknown);
 # 12.8.1-devel-ubuntu24.04 does, and it matches the CUDA 12.8 libraries measured
 # in the wheelhouse for this rule.
-SPIKE_IMAGE="${VDE_SPIKE_IMAGE:-nvidia/cuda:12.8.1-devel-ubuntu24.04}"
+SPIKE_IMAGE="${VDE_SPIKE_IMAGE:-${VDE_CUDA_BUILDER:-nvidia/cuda:12.8.1-devel-ubuntu24.04}}"
 
 # The bind-mounted repo is owned by the host uid, so git inside the container
 # refuses the index as "dubious ownership". Configure it through env rather than
@@ -37,7 +52,14 @@ fi
 ensure_tools() {
     if [ -z "$(docker images -q "$TOOLS" 2>/dev/null)" ]; then
         echo "building $TOOLS"
-        docker build -f "$REPO/docker/Dockerfile.tools" -t "$TOOLS" "$REPO"
+        local detail
+        if ! detail="$(docker build -f "$REPO/docker/Dockerfile.tools" -t "$TOOLS" "$REPO" 2>&1)"; then
+            # The build pulls its base image from the registry, so a 401 shows up
+            # here rather than in a separate pull step.
+            report_failure "docker build of $TOOLS (base of docker/Dockerfile.tools)" "$detail"
+            return 1
+        fi
+        printf '%s\n' "$detail"
     fi
 }
 
@@ -126,6 +148,7 @@ case "$TASK" in
         ;;
     spike)
         # Needs nvcc, so this runs in a CUDA devel container, not the tools image.
+        check_image "$SPIKE_IMAGE" || exit 1
         # shellcheck disable=SC2086
         docker run --rm \
             --gpus ${GPUS} \
@@ -154,6 +177,7 @@ case "$TASK" in
     spike-run)
         # A command in the CUDA devel container. Needed for measurements that
         # require a compiler (triton builds a C extension at runtime) or nvcc.
+        check_image "$SPIKE_IMAGE" || exit 1
         # shellcheck disable=SC2086
         docker run --rm \
             --gpus ${GPUS} \
@@ -165,10 +189,23 @@ case "$TASK" in
             --entrypoint bash \
             "$SPIKE_IMAGE" -c "$*"
         ;;
+    cuda)
+        # Decide the CUDA series by command: driver, toolchain, wheelhouse. The
+        # answer is written to the variables file that build.sh then reads.
+        # Needs the GPU for nvidia-smi and the socket for --verify.
+        ensure_tools
+        run_gpu python3 "$WORKDIR/packaging/cuda.py" \
+            --out "$WORKDIR/out/cuda.env" "$@"
+        ;;
     gpu)
         # A command in the tools container with a GPU attached, for arch detection.
         # shellcheck disable=SC2086
         run_gpu bash -c "$*"
+        ;;
+    pull)
+        # Pull an image through the helper so a 401 is reported to the user
+        # instead of retried. Nothing is downloaded on the host.
+        check_image "$1" || exit 1
         ;;
     shell)
         ensure_tools
@@ -198,7 +235,10 @@ docker/run.sh <task> [args]
   spike [variant]       libtorch build variants (CUDA devel container)
   spike-run "<command>" run a command in the CUDA devel container (needs a compiler)
   compile "<command>"   run a command with gcc + libc6-dev installed for one run
+  cuda [args]           decide the CUDA series by command, write out/cuda.env
   gpu "<command>"       run a command in the tools container with a GPU attached
+  pull <image>            pull an image through the helper: a 401 is reported to
+                        the user, not retried
   shell                 interactive shell inside the container
 
 Nothing in this script runs on the host interpreter.

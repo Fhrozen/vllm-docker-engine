@@ -23,6 +23,20 @@ Rules:
   `# syntax=`.
 - Base images are digest-pinned when a claim about reproducibility is made.
   Until a pull is verified, the base is reported as not pinned.
+- Builder and base tags come from the detected environment, not from a hardcoded
+  default: `bash docker/run.sh cuda` reads the driver version and installed CUDA,
+  writes `out/cuda.env`, and `build.sh` sources it. These are personal/local
+  images, so the detected environment is the input. Values in the file are
+  single-quoted because the file is sourced.
+- A CUDA version the user sets (`--cuda` or `VDE_CUDA`) wins over detection. The
+  only condition is the installed driver: if it cannot run the selected version,
+  raise an error naming the driver as the cause and say to use another CUDA
+  version or update the driver.
+- A 401 from a registry or package index is reported to the user, not retried.
+  Nothing retries, changes credentials, or guesses an alternate URL. Check an
+  image before using it (`docker/pull.sh`, `check_image`): an image that is
+  already local is used without pulling, and a failed pull prints the source,
+  the reason, and the ask to check availability or download the file directly.
 - Gates read from image metadata, not from Dockerfile text. `USER`, `HEALTHCHECK`,
   `ENTRYPOINT`, and forbidden tools are checked on the built image.
 - Three stages: build, verify, runtime. Verify runs the manifest re-hash, the

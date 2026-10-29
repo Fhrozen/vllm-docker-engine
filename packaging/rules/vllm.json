@@ -89,6 +89,7 @@
   "bytecode": "pyc-only",
   "strip": true,
   "arch_filter": "auto",
+  "cuda_variant": "nvidia_cutlass_dsl",
   "system_libs": [
     "libcudart.so.12",
     "libcublas.so.12",

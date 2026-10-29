@@ -42,6 +42,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import report  # noqa: E402
 import rules as rules_mod  # noqa: E402
 
 CHUNK = 1024 * 1024
@@ -274,7 +275,18 @@ def download(
             f"check() enforces target {target} on the wheel filenames"
         )
     args.extend(names)
-    subprocess.run(args, check=True)
+    try:
+        done = subprocess.run(args, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        # A 401 from the index is an availability problem on the source, so it is
+        # reported to the user rather than retried here.
+        report.notify(
+            f"pip download into {wheelhouse}",
+            (exc.stdout or "") + (exc.stderr or ""),
+        )
+        raise SystemExit(1)
+    if done.stdout:
+        print(done.stdout, end="")
 
 
 def write_lock(wheelhouse: Path, dest: Path, target: str) -> int:

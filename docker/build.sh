@@ -10,6 +10,12 @@
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Same 401 reporting as docker/run.sh: a base image that the registry will not
+# serve is reported, not retried, so the user can check the source or download it.
+# shellcheck disable=SC1090
+. "$REPO/docker/pull.sh"
+
 ALLOWED=("packaging" "docker" "tools")
 CONTEXT="${VDE_CONTEXT:-$REPO/out/context}"
 
@@ -18,13 +24,26 @@ CONTEXT="${VDE_CONTEXT:-$REPO/out/context}"
 # correct path is the bind mount (/workspace), not the host path — the daemon
 # never resolves a host path here, it receives the archive.
 
+# The CUDA values come from the variables file written by the cuda task, which
+# reads them by command from the machine the image will run on. This script is a
+# consumer of that decision, not the place where the decision is made. When the
+# file is absent nothing is assumed beyond the fallback the Dockerfile declares.
+CUDA_ENV="${VDE_CUDA_ENV:-$REPO/out/cuda.env}"
+if [ -f "$CUDA_ENV" ]; then
+    # shellcheck disable=SC1090
+    . "$CUDA_ENV"
+fi
+
 VARIANT="engine"
 PACKAGING="thin"
 TAG="vllm-slim:dev"
-BASE="ubuntu:24.04"
-BUILDER="python:3.12-slim"
+BASE="${VDE_RUNTIME_BASE:-ubuntu:24.04}"
+BUILDER="${VDE_CUDA_BUILDER:-python:3.12-slim}"
 FLAVOR="slim"
 ARCH="auto"
+CUDA_SERIES="${VDE_CUDA_SERIES:-auto}"
+CUDA_KEEP="${VDE_CUDA_KEEP:-auto}"
+DRIVER="${VDE_DRIVER_VERSION:-}"
 TARGET_ARCH="linux-x86_64"
 CTX_ONLY=0
 
@@ -39,6 +58,8 @@ usage: bash docker/build.sh [options]
   --builder IMAGE              build stage base
   --flavor NAME                label written into the image title
   --arch LIST|auto             CUDA architectures for the arch filter
+  --cuda SERIES|auto           CUDA series, e.g. 12; default is out/cuda.env
+  --keep SERIES|auto           which duplicate copy survives; default is out/cuda.env
   --target TRIPLET             wheel platform tag for lock generation
   --ctx-only                   assemble the context and stop, do not build
 USAGE
@@ -53,6 +74,8 @@ while [ $# -gt 0 ]; do
         --builder) BUILDER="$2"; shift 2 ;;
         --flavor) FLAVOR="$2"; shift 2 ;;
         --arch) ARCH="$2"; shift 2 ;;
+        --cuda) CUDA_SERIES="$2"; shift 2 ;;
+        --keep) CUDA_KEEP="$2"; shift 2 ;;
         --target) TARGET_ARCH="$2"; shift 2 ;;
         --ctx-only) CTX_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -93,12 +116,21 @@ if [ "$CTX_ONLY" = "1" ]; then
     exit 0
 fi
 
+# Both stages pull from the registry, so a base that is not available is reported
+# before the build starts rather than inside a build step.
+for image in "$BUILDER" "$BASE"; do
+    check_image "$image" || exit 1
+done
+
 docker build \
     -f "$REPO/$DOCKERFILE" \
     --build-arg BASE="$BASE" \
     --build-arg BUILDER="$BUILDER" \
     --build-arg TARGET_ARCH="$TARGET_ARCH" \
     --build-arg CUDA_ARCH="$ARCH" \
+    --build-arg CUDA_SERIES="$CUDA_SERIES" \
+    --build-arg CUDA_KEEP="$CUDA_KEEP" \
+    --build-arg DRIVER="$DRIVER" \
     --build-arg PACKAGING="$PACKAGING" \
     --build-arg VERSION="${TAG#*:}" \
     --label "org.opencontainers.image.title=vllm-${FLAVOR}" \

@@ -9,7 +9,7 @@ next action. Every number here must come from a run in this repo, not from an es
 | --- | --- | --- |
 | 0 — files & plan | done | `Plan.md`, `memory.md`, `wiki.md`, `docs/`, agents |
 | 1 — package research | complete (research + measurement) | findings folded into `Plan.md`, numbers in `docs/SIZES.md` |
-| 2 — docker build spikes | not started | needs a runnable base image (Docker Hub pulls previously failed with 401; local `vllm/vllm-openai:latest` works) |
+| 2 — docker build spikes | ready, not started | the three rules are implemented, tested and documented, so the next step is the first build. Needs a runnable base image: `nvidia/cuda:12.8.1-devel-ubuntu24.04` is already local, and `bash docker/run.sh pull <image>` now reports a 401 instead of retrying. Docker Hub pulls previously failed with 401; local `vllm/vllm-openai:latest` works |
 | 3 — vLLM slim image | tooling written, gates + tests green in docker | `packaging/` + `docker/` are in place |
 | 3b — harness | tooling written, no measurements yet | `tools/measure.sh` |
 | 4 — vllm-omni overlay | blocked on the Phase 3 gate | gate: <= 4 GB AND >= 60% smaller than baseline |
@@ -49,9 +49,20 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | `gate` on `packaging/importscan.py` `packaging/package_thin.py` `tools/check_dist_gate.py` `tests/test_packaging.py` | clean |
 | `gate` on `docker/build.sh` | clean |
 | `gate` on `docs/findings.md` `docs/SIZES.md` `docs/DOCKER.md` `README.md` `Plan.md` `memory.md` `wiki.md` `.github/instructions/packaging.instructions.md` `tools/check_loader_paths.py` | first run FAILED: 8 MD013 line-length issues (5 in `docs/findings.md` table rows, 1 in `docs/DOCKER.md`, 1 in `docs/SIZES.md`, plus the same file re-checked after rewrap). After rewrapping: clean. markdownlint skipped `Plan.md`, `memory.md`, `wiki.md` and the instructions file as outside the gated pattern |
+| `gate` on `README.md` `docs/findings.md` `docs/PACKAGING.md` `docs/DOCKER.md` `docs/SIZES.md` after the CUDA-by-command docs pass | first run FAILED: 3 MD013 issues (2 in `docs/DOCKER.md`, 1 in `docs/PACKAGING.md`). After rewrapping prose at word boundaries: clean, 0 issues in 5 files |
+| MD013 behaviour, measured with a probe file | prose lines and table rows are checked, fenced code blocks are not: a prose line of 82 and a table row of 82 were reported, an 85-character line inside a fence was not. Command examples in fenced blocks may therefore exceed 80 |
+| the CUDA docs pass, after an auto-reflow script damaged it | the four `docs/` files were reverted to HEAD by the user; the CUDA content was re-added by hand (prose wrapped at ≤80) and `README.md` was rewritten without its duplicated paragraphs. Gate re-run on the 5 files explicitly: clean, 0 issues. Lesson: never reflow markdown with a script — wrap prose with explicit edits, one paragraph at a time |
 | `test` re-run after the loader docs pass | 92 passed, exit 0 |
 | module-level import scan of the clone | `huggingface_hub` 12, `torchvision` 10, `flashinfer` 7, `torchaudio` 3, `ninja` 0, `sentencepiece` 0, `setuptools` 0, `model-hosting-container-standards` 0 |
 | `build --variant engine` | failed at stage 1: `ModuleNotFoundError: No module named 'importscan'` — the context is built from `git ls-files`, which lists tracked files only, so the new `packaging/importscan.py` was not in the context |
+| `gate` on `packaging/cuda.py` `packaging/rules.py` `packaging/package.py` `packaging/package_thin.py` `packaging/rules/vllm.json` `docker/Dockerfile.vllm` `docker/build.sh` `docker/run.sh` `tests/test_cuda.py` | first run FAILED, not on a lint issue: `bash docker/run.sh` sources `out/cuda.env`, and the unquoted line `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a command (`nvcc fatal : Don't know what to do with 'PATH'`). After quoting every value in `write_env`: clean, 3 files reformatted |
+| `test` (114 tests) | exit 0, all passed, run twice (before and after the gate reformatted files) |
+| `cuda --verify` measured run on the GPU | driver 580.95.05, driver CUDA 13.0, no nvcc in the tools container, wheelhouse series 12 (16 of 17 wheels), tree series 13, declared series 12, surviving copy 13, builder `nvidia/cuda:12.8.1-devel-ubuntu24.04` verified by `docker manifest inspect`, runtime base `ubuntu:24.04` |
+| both branches of the duplicate-copy prune, run against the real tree | keep cu12 → 48,672 files / 10,736.2 MB (cutlass 462.6 MB, 43.7 MB pruned); keep cu13 → 48,672 files / 10,736.3 MB (cutlass 462.7 MB, 43.6 MB pruned); no series → 48,673 files / 10,779.9 MB (nothing pruned). The two branches are the same size, so the decision is which copy the loader resolves, not which is smaller |
+| user-set CUDA against the driver ceiling, asserted by `tests/test_cuda.py` | a user value above the ceiling raises an error naming the driver as the cause and says to use another CUDA version or update it; a user value equal to the ceiling is accepted; a user value the wheelhouse disagrees with is accepted and records that the wheelhouse copy must be fetched; a user value below the ceiling needs no wheelhouse warning |
+| 401 reporting, measured in the container | a fabricated 401 detail prints the source, the sentence asking the user to check availability or download directly, and the detail itself; `check_image` on an image that is already local returns without pulling; `nvidia/cuda:12.4.1-devel-ubuntu24.04` prints the registry failure without the 401 sentence and exits 1. A real network 401 has not been observed since the rule was written |
+| `test` (127 tests) | exit 0, all passed. Six failures were fixed first: the driver-error wording needed the "would not start on this machine" clause, `check_image_size` needed the 6 GB gate threshold with 4 GB as the stretch goal, and the report/shell-copy parity test reads `docker/pull.sh` from the repo root |
+| `gate` on the 19 files changed for the three new rules | clean: ruff check and format (6 python files unchanged), `check_files`, shellcheck, `bash -n`, typos, and markdownlint 0 issues in the 5 gated files. `wiki.md`, `memory.md`, `Plan.md` and the `.github/` files are outside the markdownlint pattern and were skipped. Re-gated after wrapping the added prose at 80 columns: clean, and `test` re-run at 127 passed |
 
 ### Build runs
 
@@ -332,6 +343,24 @@ That is what a real loader does, so it is stricter than `uncovered()`.
 | `vllm-slim` (.pyc-only ship) | — | — | — | — | — |
 | `vllm-omni` overlay | — | — | — | — | — |
 
+### Interim reading, not a verdict
+
+No image has been built from this rule yet, so the table above is still empty and
+this is a reading of the selection numbers, not a measured image.
+
+What the measurements do support: the reduction has to come from the layout
+(plain base, copy-only site-packages, single arch, no toolchain), not from
+pruning files. The 18 largest files are 62.9% of the selection and none of them
+is reachable by a glob — they are the libraries libtorch links. A workload maps
+38 files / 5,798.9 MB, so the process floor is about 5.8 GB of libraries before
+any vLLM code, and the 3,878.1 MB that a run never loads is still shipped unless
+a torch source build turns those features off (~692.8 MB, the only route to it).
+
+Against the local baseline image (23.4 GB as reported by `docker images`), the
+gap is mostly the CUDA base/devel toolchain, pip, and caches — that part is
+removable. The library floor is not. So the honest range is ~60–70% smaller, not
+a tenth.
+
 ## Decisions
 
 - Strata is reference only; behaviour reimplemented in `packaging/`. No Strata path in any image.
@@ -342,11 +371,30 @@ That is what a real loader does, so it is stricter than `uncovered()`.
 - No compiler, no pip, no uv, no git, no downloader in the runtime image (gate `R01`).
 - `libcuda.so.1` and `libnvidia-*` are never bundled — the host driver provides them.
 - Nothing executes on the host. `docker/run.sh` is the only host-side entry point;
-  it issues `docker build` / `docker run` and every gate, test and measurement runs
-  inside the pinned tools container (`docker/Dockerfile.tools`). Content moves
-  between images, code does not run on the host.
+  it issues docker daemon commands (`build`, `run`, `pull`, `images`) and every
+  gate, test and measurement runs inside the pinned tools container
+  (`docker/Dockerfile.tools`). Content moves between images, code does not run on
+  the host.
 - Experimental research repo: when a decision is not clear, evaluate both options
   and select from the results. Open decisions are listed in `docs/findings.md`.
+- CUDA is decided by command, not by a default: driver version and installed CUDA are
+  read, stored in `out/cuda.env`, and used to select the builder tag. Values are
+  single-quoted because `docker/run.sh` sources the file. Two values are recorded —
+  the declared series (wheelhouse, 12) and the surviving copy (tree, 13) — and the
+  prune follows the surviving copy. Runtime base is `ubuntu:24.04` (finding 6).
+- A CUDA version the user sets wins over detection. The only condition is the
+  installed driver, and the error names the driver as the cause and says to use
+  another CUDA version or update it. A user value that disagrees with the
+  wheelhouse is a warning, not an error.
+- A 401 is reported to the user, not retried: the source and the reason are
+  printed and the user is asked to check availability or download the file
+  directly. Nothing retries, changes credentials, or guesses an alternate URL.
+  The wording has one source (`packaging/report.py`), with `docker/pull.sh` as its
+  shell copy guarded by a parity test. An image that is already local is used
+  without pulling.
+- Size target: an image under 6 GB, with 4 GB kept as the stretch goal and
+  reported separately. Reduction against the baseline (≥ 60%) is the second
+  condition.
 
 ## Dead ends
 
@@ -383,4 +431,13 @@ That is what a real loader does, so it is stricter than `uncovered()`.
    only option that survives a direct `ctypes.CDLL`. Evaluate both and pick from the
    run, per the repo rule.
 8. Decide the CUDA version the image declares: driver ceiling (13.0) vs wheelhouse
-   (cu12). This decides whether the cutlass-dsl cu12 duplicate (41.6 MB) is pruned.
+   (cu12). Both branches have now been run against the real tree — 43.7 MB pruned for
+   keep=12, 43.6 MB for keep=13, nothing pruned when no series is given — so the
+   branches are the same size and the choice is which copy the loader resolves. The
+   `system_libs` names in the rule are `.12` sonames and must change if the declared
+   series becomes 13.
+9. Check the base image through the helper before building:
+   `bash docker/run.sh pull nvidia/cuda:12.8.1-devel-ubuntu24.04`. That image is
+   already local on this host, so `check_image` returns without pulling. If a pull
+   is needed and the registry answers 401, the user is asked to check availability
+   or download the image directly; the build does not retry.

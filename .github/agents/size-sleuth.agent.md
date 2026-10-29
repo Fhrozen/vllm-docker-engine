@@ -15,8 +15,10 @@ Rules:
   Nothing executes on the host.
 - Sizes are recorded in `docs/SIZES.md`. An estimate is labelled as an estimate
   and never written as a measurement.
-- The Phase 4 gate is ≤ 4 GB **and** ≥ 60% smaller than the baseline. Both must
-  be measured, and the baseline must be measured, not quoted from documentation.
+- The Phase 4 gate is an image **under 6 GB** **and** ≥ 60% smaller than the
+  baseline. 4 GB is the stretch goal, reported separately from the gate. Both
+  must be measured, and the baseline must be measured, not quoted from
+  documentation.
 - When a reduction is claimed, name the mechanism (arch filter, pruning,
   `.pyc`-only, strip, copy-only site-packages) and show the before and after.
 - Distinguish on-disk from compressed download size. They are different metrics

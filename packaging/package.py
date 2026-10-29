@@ -32,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import arch as arch_mod  # noqa: E402
+import cuda as cuda_mod  # noqa: E402
 import libdeps  # noqa: E402
 import rules as rules_mod  # noqa: E402
 
@@ -56,6 +57,7 @@ def select(
     rule: dict,
     archs: list[str],
     owner: dict[str, str] | None = None,
+    cuda_series: int | None = None,
 ) -> list[str]:
     """Relative paths that the rule wants, sorted, no symlinks, no statics."""
     picked: list[str] = []
@@ -67,6 +69,8 @@ def select(
             continue
         rel = path.relative_to(src).as_posix()
         if rules_mod.denied(rel, rule, owner) or rules_mod.pruned(rel, rule):
+            continue
+        if rules_mod.cuda_variant(rel, rule, cuda_series):
             continue
         if not rules_mod.matches(rel, rule["allow"]):
             continue
@@ -116,6 +120,7 @@ def write_manifest(
     rule: dict,
     archs: list[str],
     entries: list[dict],
+    cuda_series: int | None = None,
 ) -> dict:
     manifest = {
         "schema_version": rule["schema_version"],
@@ -125,6 +130,9 @@ def write_manifest(
         "platform": rule["platform"],
         "backend": rule["backend"],
         "archs": archs,
+        "cuda_series": cuda_series
+        if cuda_series is not None
+        else rule.get("cuda_series"),
         "min_driver": rule.get("min_driver", ""),
         "build_id": build_id(entries),
         "entrypoint": rule["entrypoint"],
@@ -307,7 +315,14 @@ def write_archive(pkg: Path, dest: Path, manifest: dict) -> Path:
     return dest
 
 
-def build(src: Path, rule: dict, out: Path, archs: list[str], archive: bool) -> Path:
+def build(
+    src: Path,
+    rule: dict,
+    out: Path,
+    archs: list[str],
+    archive: bool,
+    cuda_series: int | None = None,
+) -> Path:
     if not src.is_dir():
         raise SystemExit(f"source tree not found: {src}")
     rule["version"] = resolve_version(src, rule)
@@ -317,7 +332,7 @@ def build(src: Path, rule: dict, out: Path, archs: list[str], archive: bool) -> 
     out.mkdir(parents=True, exist_ok=True)
 
     archs = list(archs)
-    picked = select(src, rule, archs)
+    picked = select(src, rule, archs, cuda_series=cuda_series)
     if not picked:
         raise SystemExit("rule selected nothing -- check allow/deny/prune patterns")
 
@@ -347,7 +362,7 @@ def build(src: Path, rule: dict, out: Path, archs: list[str], archive: bool) -> 
             {"path": rel, "sha256": sha256(path), "bytes": path.stat().st_size}
         )
 
-    manifest = write_manifest(staged, rule, archs, entries)
+    manifest = write_manifest(staged, rule, archs, entries, cuda_series)
     problems = verify(staged, full=True)
     if problems:
         shutil.rmtree(staged)
@@ -387,6 +402,11 @@ def main() -> int:
     ap.add_argument("--out", default="out/packages")
     ap.add_argument("--arch", help="comma-separated archs; default is detection")
     ap.add_argument(
+        "--cuda",
+        help="CUDA series to keep, e.g. 12; default is the variables file or detection",
+    )
+    ap.add_argument("--wheelhouse", help="used only to fall back when --cuda is auto")
+    ap.add_argument(
         "--archive", action="store_true", help="also write a deterministic tar.gz"
     )
     ap.add_argument(
@@ -407,6 +427,9 @@ def main() -> int:
 
     rule = rules_mod.load(args.rule or "vllm")
     archs = arch_mod.resolve(args.arch)
+    series = cuda_mod.resolve(
+        args.cuda, Path(args.wheelhouse) if args.wheelhouse else None
+    )
 
     if args.verify:
         pkg = Path(args.src)
@@ -417,7 +440,7 @@ def main() -> int:
     if args.no_strip:
         rule["strip"] = False
 
-    build(Path(args.src), rule, Path(args.out), archs, args.archive)
+    build(Path(args.src), rule, Path(args.out), archs, args.archive, series)
     return 0
 
 

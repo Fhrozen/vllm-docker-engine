@@ -3,8 +3,12 @@
 
 Mirrors the shape of `.buildkite/check-wheel-size.py` in the vLLM clone, but
 measures an image rather than a wheel, and compares against a baseline image so
-the Phase 4 gate ("<= 4 GB AND >= 60% smaller than baseline") is a number, not
-an opinion.
+the Phase 4 gate is a number, not an opinion.
+
+The gate threshold is the target the user set: an image under 6 GB is good
+enough. 4 GB is kept as the stretch goal, so `--budget 4GB` is still a valid
+stricter run. The reduction against the baseline is a secondary condition: it is
+what shows the shrink came from the packaging and not from a different engine.
 
 Nothing here estimates. A number is printed only when it was read from the
 docker daemon; anything that cannot be read is reported as UNVERIFIED.
@@ -17,7 +21,8 @@ import json
 import shutil
 import subprocess
 
-BUDGET_BYTES = 4 * 1024 * 1024 * 1024
+BUDGET_BYTES = 6 * 1024 * 1024 * 1024
+STRETCH_BYTES = 4 * 1024 * 1024 * 1024
 TOP_N = 10
 
 
@@ -98,7 +103,11 @@ def main() -> int:
     )
     ap.add_argument("--image", required=True)
     ap.add_argument("--baseline", help="image to compare against (the Phase 3 result)")
-    ap.add_argument("--budget", default="4GB", help="size budget, e.g. 4GB or 3500MB")
+    ap.add_argument(
+        "--budget",
+        default="6GB",
+        help="size budget, e.g. 6GB (the target) or 4GB (the stretch goal)",
+    )
     ap.add_argument("--top", type=int, default=TOP_N)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
@@ -136,6 +145,11 @@ def main() -> int:
         problems.append(
             f"over budget: {human(report['unpacked_bytes'])} > {human(budget)}"
         )
+    # Not a failure: the target is met, the stretch goal is not. Recorded so the
+    # difference between the two is visible in the run output.
+    report["stretch_goal"] = (
+        "not met" if report["unpacked_bytes"] > STRETCH_BYTES else "met"
+    )
     if report["reduction"] is not None and report["reduction"] < 60.0:
         problems.append(
             f"not enough smaller than baseline: {report['reduction']}% < 60%"
@@ -148,6 +162,7 @@ def main() -> int:
         print(f"unpacked: {human(report['unpacked_bytes'])}")
         shown = human(compressed) if compressed else "UNVERIFIED"
         print(f"compressed download: {shown} ({how})")
+        print(f"stretch goal ({human(STRETCH_BYTES)}): {report['stretch_goal']}")
         if report["baseline"]:
             print(
                 f"baseline: {human(report['baseline']['unpacked_bytes'])} "

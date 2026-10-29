@@ -16,6 +16,8 @@ bash docker/run.sh runtime <image>             # R01 config gate
 bash docker/run.sh measure <image>             # cold start, tokens/s, peak GPU
 bash docker/run.sh gpu "<command>"             # a command with a GPU attached
 bash docker/run.sh py "<snippet>"              # run a snippet in the container
+bash docker/run.sh cuda                        # writes out/cuda.env
+bash docker/run.sh pull <image>                # pull through the helper
 bash docker/run.sh script <file> [args]        # run a repo script in the container
 bash docker/run.sh spike-run "<command>"       # a command that needs a compiler
 bash docker/run.sh compile "<command>"         # a command with gcc + libc6-dev
@@ -35,6 +37,29 @@ design. triton looks up its cache **before** looking up a compiler, so a cache
 miss in the runtime image is a hard failure under R01. The build stage must warm
 triton's cache for the shapes the target model uses and ship it; the cache key
 contains no GPU architecture, so warming must happen on the target arch.
+
+The `cuda` task writes `out/cuda.env`. `run.sh` and `build.sh` source that
+file, so every value in it is single-quoted. This was measured: an unquoted
+`VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a command and the gate
+failed with `nvcc fatal : Don't know what to do with 'PATH'`. `build.sh` takes
+`--cuda SERIES|auto` and `--keep SERIES|auto`, falling back to the variables
+file. The reading must happen in a CUDA devel container, because `nvcc` is not
+in the tools image — the reading is done in a `spike-run` container instead.
+
+A CUDA version the user sets (`--cuda` or `VDE_CUDA`) wins over detection. The
+only condition on it is the installed driver: if the driver cannot run the
+selected version, the script raises an error naming the driver as the cause and
+says to use another CUDA version or update the driver.
+
+The `pull` task and the `spike` tasks go through `docker/pull.sh`, the shell copy
+of `packaging/report.py`. `check_image` returns straight away when an image is
+already local, so no pull is attempted for it. On a 401 the source and the reason
+are printed and the user is asked to check availability or download the file
+directly; nothing retries, changes credentials, or guesses an alternate URL.
+Measured in the container: a fabricated 401 detail prints the sentence, an
+already-local image returns without pulling, and
+`nvidia/cuda:12.4.1-devel-ubuntu24.04` prints the refusal without the sentence
+and exits 1. A test fails if the shell copy drifts from the module.
 
 The tools image holds the pinned gate versions from the reference clone's
 pre-commit config: ruff 0.14.10, typos 1.49.0, markdownlint-cli2 0.23.2,
@@ -118,7 +143,7 @@ missing library is `libcuda.so.1`.
 
 This is why the runtime stage stays on a plain base: `ubuntu:24.04` is 0.07 GB on
 disk, a CUDA base is 0.28 GB (cu12) or 0.53 GB (cu13), and a CUDA runtime image
-is 2.22–3.17 GB — over the 4 GB budget before anything is added. The loader path
+is 2.22–3.17 GB — over the 6 GB target before anything is added. The loader path
 is an open decision, recorded in `docs/findings.md`.
 
 ## Verified
@@ -127,7 +152,16 @@ Recorded from runs inside the container:
 
 - gates: clean on 6 explicitly passed files (the evaluation changes), and clean
   on 27 files in the earlier run
-- tests: 92 passed, exit 0
+- gates: clean on the 19 files changed for the three rules added in this phase
+  (the driver condition, the 401 reporting rule, the 6 GB target). markdownlint
+  reported 0 issues in the 5 gated files
+- gates: clean on the 9 CUDA-by-command files. That run first FAILED, not on a
+  lint issue: `run.sh` sources `out/cuda.env`, and the unquoted line
+  `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a command
+  (`nvcc fatal : Don't know what to do with 'PATH'`). After quoting every value
+  in `write_env`: clean, 3 files reformatted
+- tests: 127 passed, exit 0. The earlier run was 114; the added tests cover the
+  driver condition, the 401 reporting rule, and the shell-copy parity check
 - GPU read through the harness: `NVIDIA GeForce RTX 3060`, compute cap 8.6, so
   the target arch is `sm_86`
 - `check_files.py` with no arguments: exit 1, refuses

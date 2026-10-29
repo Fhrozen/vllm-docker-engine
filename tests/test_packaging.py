@@ -7,6 +7,7 @@ Run inside the container: bash docker/run.sh test
 import io
 import json
 import shutil
+import subprocess
 import sys
 import tarfile
 import types
@@ -487,9 +488,9 @@ def test_check_rejects_a_wheel_outside_the_target(tmp_path):
 def test_download_resolves_for_the_running_environment(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_run(args, check=True):
+    def fake_run(args, check=True, **kwargs):
         captured["args"] = args
-        return 0
+        return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(lock_mod.subprocess, "run", fake_run)
     lock_mod.download(["foo"], tmp_path / "wh", "linux-x86_64")
@@ -501,9 +502,9 @@ def test_download_resolves_for_the_running_environment(monkeypatch, tmp_path):
 def test_cross_download_pins_tags_and_repeats_them(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_run(args, check=True):
+    def fake_run(args, check=True, **kwargs):
         captured["args"] = args
-        return 0
+        return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(lock_mod.subprocess, "run", fake_run)
     lock_mod.download(["foo"], tmp_path / "wh", "linux-x86_64", cross=True)
@@ -513,6 +514,30 @@ def test_cross_download_pins_tags_and_repeats_them(monkeypatch, tmp_path):
     assert "--python-version" in args and "--python_version" not in args
     assert args.count("--abi") == len(lock_mod.TARGETS["linux-x86_64"]["abi"])
     assert args.count("--platform") == len(lock_mod.TARGETS["linux-x86_64"]["platform"])
+
+
+def test_a_401_download_failure_names_the_source_and_asks_for_support(
+    monkeypatch, tmp_path, capsys
+):
+    # Measured here: earlier Docker Hub pulls failed with 401, so a download
+    # failure that looks like a 401 has to be reported to the user rather than
+    # retried by the build.
+    def fake_run(args, check=True, **kwargs):
+        raise lock_mod.subprocess.CalledProcessError(
+            1,
+            args,
+            output="401 Client Error: Unauthorized for url: https://pypi.org/simple/foo/",
+            stderr="",
+        )
+
+    monkeypatch.setattr(lock_mod.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        lock_mod.download(["foo"], tmp_path / "wh", "linux-x86_64")
+    printed = capsys.readouterr().out
+    assert "download failed" in printed
+    assert str(tmp_path / "wh") in printed
+    assert "check the availability" in printed
+    assert "download it directly" in printed
 
 
 def test_read_requirements_drops_markers_and_options(tmp_path):
@@ -1086,10 +1111,18 @@ def test_maps_reader_takes_the_path_field(tmp_path):
 def test_size_gate_budget_and_reduction():
     import check_image_size
 
-    assert check_image_size.BUDGET_BYTES == 4 * 1024 * 1024 * 1024
-    assert check_image_size.human(check_image_size.BUDGET_BYTES) == "4.00 GB"
+    # The target the user set: under 6 GB is good enough. 4 GB stays as the
+    # stretch goal, so a stricter run is still expressible with --budget 4GB.
+    assert check_image_size.BUDGET_BYTES == 6 * 1024 * 1024 * 1024
+    assert check_image_size.STRETCH_BYTES == 4 * 1024 * 1024 * 1024
+    assert check_image_size.human(check_image_size.BUDGET_BYTES) == "6.00 GB"
 
-    # Phase 4 gate: <= 4 GB AND >= 60% smaller than the baseline.
+    # An image that meets the target but not the stretch goal is not a failure.
+    under_target = 5 * 1024 * 1024 * 1024
+    assert under_target <= check_image_size.BUDGET_BYTES
+    assert under_target > check_image_size.STRETCH_BYTES
+
+    # The reduction against the baseline is the secondary condition.
     baseline = 23 * 1024 * 1024 * 1024
     slim = 3 * 1024 * 1024 * 1024
     assert slim <= check_image_size.BUDGET_BYTES

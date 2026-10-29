@@ -44,6 +44,7 @@ skips it — the manifest can only vouch for the files it names.
   "bytecode": "skip",
   "strip": true,
   "arch_filter": "auto",
+  "cuda_variant": "nvidia_cutlass_dsl",
   "system_libs": ["libcudart.so.12"],
   "driver_libs": ["libcuda.so.1"],
   "runtime_apt": ["tini"],
@@ -57,6 +58,11 @@ skips it — the manifest can only vouch for the files it names.
 Patterns are fnmatch with `**` spanning path separators. `arch_filter: "auto"`
 uses the detected archs; a file with no architecture in its name is shared data
 and is kept.
+
+`cuda_variant` is optional. It names a package that ships more than one CUDA
+series, so the prune needs to know which copy to keep — see the section on CUDA
+values below. `rules.cuda_variant()` returns False when the rule has no key or
+when no series is given.
 
 ## Manifest schema (version 2)
 
@@ -235,6 +241,78 @@ warm it on the target arch.
 Minimum warm cache for one kernel: 10 files, 0.07 MB. A cache covering the
 shapes a model uses is small enough to ship, so R01 can stand. The choice is
 recorded in `Plan.md` as an open decision.
+
+## CUDA values come from commands
+
+The detection module (`packaging/cuda.py`) is stdlib only and imports nothing
+from the reference clones. Values are resolved in this order:
+
+1. an explicit override (`VDE_CUDA`, or a value passed on the command line);
+2. the variables file written by detection (`out/cuda.env`);
+3. the command itself: `nvidia-smi` for the driver, `nvcc --version` for the
+   installed toolchain;
+4. the wheelhouse as the floor — a cu12 wheel cannot be relabelled cu13.
+
+Each value records how it was obtained, so a number in a report can be traced
+back to the command that produced it. `run()` returns an empty string on
+`OSError` or a timeout, so detection never fails a build.
+
+The variables file is sourced by shell, so every value must be single-quoted.
+Measured failure: `VDE_INSTALLED_CUDA_HOW=no nvcc on PATH` was executed as a
+command and the gate failed with `nvcc fatal : Don't know what to do with
+'PATH'`.
+
+A value the user sets wins over detection. `select_series()` takes it first, and
+the only condition on it is the installed driver: when the driver cannot run the
+selected version, `driver_error()` raises an error that names the driver as the
+cause and says to use another CUDA version or update the driver. A user value
+that disagrees with the wheelhouse is accepted with a note that the wheelhouse
+copy must be fetched — a warning, not an error, because the wheelhouse is a floor
+for what can be downloaded, not a ceiling.
+
+The reading must happen in a CUDA devel container: `nvcc` is on the host but not
+in the tools container, so `packaging/cuda.py` reports `no nvcc on PATH` there.
+
+Two values, and they are not the same:
+
+| Value | What it names | Measured here |
+| --- | --- | --- |
+| `VDE_CUDA_SERIES` | the series the wheelhouse declares | 12 |
+| `VDE_CUDA_KEEP` | the copy the environment resolves | 13 |
+
+`--cuda` resolves a series in this order: explicit value, `VDE_CUDA_KEEP`,
+`VDE_CUDA_SERIES`, then the wheelhouse. The prune follows the surviving copy,
+not the declared series. `select_series()` raises when a value is above the
+driver ceiling, because that image would not start. `tag_for()` uses a tag
+confirmed to exist on the registry, otherwise it falls back to the known default
+for the series.
+
+Verified: `write_env()` and `read_env()` round trip a quoted value that contains
+spaces; `rules.cuda_variant()` returns False when the rule has no key or no
+series is given; both prune branches were measured against the real tree (rule
+`vllm`, arch `sm_86`) — keep cu12 43.7 MB pruned, keep cu13 43.6 MB, no series
+0.0 MB. Tests also assert that a user value above the driver ceiling raises, that
+a value at the ceiling is accepted, and that the shell copy of the 401 sentence
+matches the module.
+
+## Download failures
+
+`packaging/report.py` holds the wording for a failed download. A 401 means the
+source may not be available, which a build cannot fix by trying again, so nothing
+retries, changes credentials, or guesses an alternate URL: `notify()` prints the
+source, the sentence asking the user to check availability or download the file
+directly, and the reason itself, because that is what the user has to look at.
+
+`docker/pull.sh` is the shell copy, because a shell script cannot import the
+module, and `tests/test_report.py` reads that file and fails if the two drift. A
+failure that is not an auth failure prints the source and the reason without the
+sentence.
+
+Measured runs in the container: a fabricated 401 detail prints the sentence;
+`check_image` on an image that is already local returns without pulling;
+`nvidia/cuda:12.4.1-devel-ubuntu24.04` prints the registry refusal without the
+sentence and exits 1. `lock.py` `download()` reports through the same module, so
+a 401 from the package index is reported the same way.
 
 ## Driver boundary
 

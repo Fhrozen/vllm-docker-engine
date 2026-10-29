@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import arch as arch_mod  # noqa: E402
+import cuda as cuda_mod  # noqa: E402
 import importscan  # noqa: E402
 import libdeps  # noqa: E402
 import package as pkg_mod  # noqa: E402
@@ -193,6 +194,7 @@ def build(
     out: Path,
     rule: dict,
     archs: list[str],
+    cuda_series: int | None = None,
 ) -> Path:
     venv = out / (rule["name"] + ".venv")
     if venv.exists():
@@ -206,7 +208,7 @@ def build(
     # The selection is the shipped set. Read it before the tree is rewritten:
     # a pyc-only rule removes the source files the scan needs to read.
     owner = importscan.top_level_map(tree)
-    selected = set(pkg_mod.select(tree, rule, archs, owner))
+    selected = set(pkg_mod.select(tree, rule, archs, owner, cuda_series))
     hard = importscan.runtime_conflicts(tree, rule, owner, selected)
     if hard:
         raise SystemExit(
@@ -214,7 +216,7 @@ def build(
             + "\n  ".join(hard)
         )
 
-    pkg = pkg_mod.build(tree, rule, out, archs, archive=True)
+    pkg = pkg_mod.build(tree, rule, out, archs, archive=True, cuda_series=cuda_series)
 
     declared = denied_dependencies(venv, rule)
     if declared:
@@ -244,11 +246,16 @@ def main() -> int:
     ap.add_argument("--rule", default="vllm")
     ap.add_argument("--out", default="out/thin")
     ap.add_argument("--arch", help="comma-separated archs; default is detection")
+    ap.add_argument(
+        "--cuda",
+        help="CUDA series to keep, e.g. 12; default is the variables file or wheelhouse",
+    )
     args = ap.parse_args()
 
     rule = rules_mod.load(args.rule)
     archs = arch_mod.resolve(args.arch)
-    build(Path(args.lock), Path(args.wheelhouse), Path(args.out), rule, archs)
+    series = cuda_mod.resolve(args.cuda, Path(args.wheelhouse))
+    build(Path(args.lock), Path(args.wheelhouse), Path(args.out), rule, archs, series)
     return 0
 
 

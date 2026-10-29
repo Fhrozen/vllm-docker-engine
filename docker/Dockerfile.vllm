@@ -4,6 +4,23 @@
 # Only the first stage may resolve, download, compile, strip or install.
 # The runtime stage is a copy of a verified tree plus a handful of apt packages.
 
+# BASE and BUILDER are the values the CUDA detection wrote into out/cuda.env.
+# `bash docker/run.sh cuda` decides them from the installed driver and toolchain;
+# build.sh sources that file when it exists. The defaults below are the fallback
+# for a machine where no detection has run, not a decision.
+#
+# Two CUDA values come from the environment and are not the same number:
+#   CUDA_SERIES is what the package declares. It comes from the wheelhouse, because a
+#     cu12 wheel cannot be relabelled cu13, and it is capped by the driver ceiling.
+#   CUDA_KEEP is which copy of a per-series folder survives. The tree holds both cu12
+#     and cu13 copies of nvidia_cutlass_dsl, and this environment resolves cu13, so the
+#     prune follows the environment rather than the wheel name.
+# Both are recorded as labels so a later run can tell which machine an image was built
+# for. A label reading `cuauto` means no detection had run for that build.
+#
+# The runtime stage is a plain base image, not a CUDA base image: the loader test showed
+# that the tree resolves its libraries through $ORIGIN RUNPATH entries, so the value of a
+# CUDA base image is its ld.so cache, not its libraries. See docs/findings.md.
 ARG BASE=ubuntu:24.04
 ARG BUILDER=python:3.12-slim
 
@@ -15,6 +32,8 @@ FROM ${BUILDER} AS pkg
 ARG RULE=vllm
 ARG TARGET_ARCH=linux-x86_64
 ARG CUDA_ARCH=auto
+ARG CUDA_SERIES=auto
+ARG CUDA_KEEP=auto
 ARG PACKAGING=thin
 ARG SOURCE_DATE_EPOCH=1600000000
 
@@ -43,11 +62,17 @@ RUN python3 /pkg/packaging/lock.py \
       --rule ${RULE} --target ${TARGET_ARCH} \
       --out /pkg/locks --wheelhouse /pkg/wheelhouse --download
 
+# --cuda is the series the detection decided, passed as a variable rather than
+# a default. `auto` here means the wheelhouse itself is read, which is the same
+# answer the detection gives when it can see the wheels.
+# --cuda-keep is the copy that survives the duplicate-folder prune. It is a separate
+# value: the wheelhouse says cu12, this environment resolves cu13, and the tree is
+# smaller if the copy the environment does not use is dropped.
 RUN python3 /pkg/packaging/package_thin.py \
       --lock /pkg/locks/vllm-${TARGET_ARCH}.txt \
       --wheelhouse /pkg/wheelhouse \
       --rule ${RULE} --out /pkg/stage \
-      --arch ${CUDA_ARCH}
+      --arch ${CUDA_ARCH} --cuda ${CUDA_SERIES} --cuda-keep ${CUDA_KEEP}
 
 # ---------------------------------------------------------------------------
 # Stage 2: verify. Re-hash the staged tree against its manifest, then gate it.
@@ -78,6 +103,9 @@ FROM ${BASE} AS runtime
 
 ARG RULE=vllm
 ARG VERSION=dev
+ARG CUDA_SERIES=auto
+ARG CUDA_KEEP=auto
+ARG DRIVER=
 ARG PACKAGING=thin
 
 ENV PYTHONPATH=/opt/vllm
@@ -98,7 +126,10 @@ LABEL org.opencontainers.image.title="vllm-slim" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.base.name="${BASE}" \
-      io.github.vllm-docker-engine.packaging="${PACKAGING}"
+      io.github.vllm-docker-engine.packaging="${PACKAGING}" \
+      io.github.vllm-docker-engine.cuda="cu${CUDA_SERIES}" \
+      io.github.vllm-docker-engine.cuda-keep="cu${CUDA_KEEP}" \
+      io.github.vllm-docker-engine.driver="${DRIVER}"
 
 VOLUME ["/root/.cache/huggingface"]
 EXPOSE 8000
