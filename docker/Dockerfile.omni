@@ -1,0 +1,76 @@
+# vllm-omni-slim: an overlay on the engine image, not a rebuild of it.
+#
+# Only vllm_omni and its package data are added. The engine image is taken as
+# the base, so the measured delta is the overlay itself -- that is the number
+# Phase 4 compares against the Phase 3 result.
+#
+# Legacy-builder-safe: no heredocs, no --mount, no `# syntax=` directive.
+
+ARG BASE=vllm-slim:dev
+ARG BUILDER=python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# Stage 1: pkg. Builds the overlay tree only, from the omni rule.
+# ---------------------------------------------------------------------------
+FROM ${BUILDER} AS pkg
+
+ARG RULE=vllm-omni
+ARG TARGET_ARCH=linux-x86_64
+ARG CUDA_ARCH=auto
+ARG SOURCE_DATE_EPOCH=1600000000
+
+WORKDIR /pkg
+
+COPY packaging/ /pkg/packaging/
+
+RUN python3 /pkg/packaging/lock.py \
+      --rule ${RULE} --target ${TARGET_ARCH} \
+      --out /pkg/locks --wheelhouse /pkg/wheelhouse --download
+
+RUN python3 /pkg/packaging/package_thin.py \
+      --lock /pkg/locks/vllm-omni-${TARGET_ARCH}.txt \
+      --wheelhouse /pkg/wheelhouse \
+      --rule ${RULE} --out /pkg/stage \
+      --arch ${CUDA_ARCH}
+
+# ---------------------------------------------------------------------------
+# Stage 2: verify. The overlay must still resolve against the engine image.
+# ---------------------------------------------------------------------------
+FROM ${BASE} AS verify
+
+ARG RULE=vllm-omni
+
+WORKDIR /pkg
+
+COPY packaging/ /pkg/packaging/
+COPY --from=pkg /pkg/stage /opt/omni/
+
+RUN python3 /pkg/packaging/package.py --verify /opt/omni
+
+# Entry points are the contract between the two packages: vllm loads
+# `vllm.general_plugins` from dist-info on sys.path, so the overlay's
+# dist-info must survive the prune or worker subprocesses lose the omni archs.
+RUN PYTHONPATH=/opt/omni:/opt/vllm python3 -c \
+      "import importlib.metadata as m; print(m.distribution('vllm-omni').entry_points)"
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime. Base is the engine image; only the overlay is added.
+# ---------------------------------------------------------------------------
+FROM ${BASE} AS runtime
+
+ARG VERSION=dev
+
+ENV VLLM_ENTRY_MODULE=vllm_omni.entrypoints.cli.main
+
+COPY --from=verify /opt/omni /opt/vllm/
+
+LABEL org.opencontainers.image.title="vllm-omni-slim" \
+      org.opencontainers.image.source="https://github.com/vllm-project/vllm-omni" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.base.name="${BASE}"
+
+USER 1000:1000
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/vllm-tools/entrypoint.sh"]
+CMD ["--model", "Qwen/Qwen3.5-0.8B"]

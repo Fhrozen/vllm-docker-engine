@@ -1,1 +1,67 @@
+# Two services: the engine image and the omni overlay built on top of it.
+#
+# GPU only. shm_size and ipc are not decoration: vLLM workers use shared memory
+# for the KV cache and for the c10d store, and a container without them fails at
+# worker startup rather than at import.
+services:
+  vllm-slim:
+    image: vllm-slim:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.vllm
+      args:
+        BASE: ubuntu:24.04
+        TARGET_ARCH: linux-x86_64
+        CUDA_ARCH: auto
+        PACKAGING: thin
+    environment:
+      VLLM_MODEL: Qwen/Qwen3.5-0.8B
+      HF_HOME: /root/.cache/huggingface
+      PORT: "8000"
+    ports:
+      - "8000:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    shm_size: 1gb
+    ipc: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  vllm-omni-slim:
+    image: vllm-omni-slim:dev
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.omni
+      args:
+        BASE: vllm-slim:dev
+        TARGET_ARCH: linux-x86_64
+        CUDA_ARCH: auto
+    environment:
+      VLLM_MODEL: Qwen/Qwen3.5-0.8B
+      VLLM_ENTRY_MODULE: vllm_omni.entrypoints.cli.main
+      HF_HOME: /root/.cache/huggingface
+      PORT: "8001"
+    ports:
+      - "8001:8001"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    shm_size: 1gb
+    ipc: host
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:
 

@@ -1,0 +1,104 @@
+# vllm-slim: three stages, pkg -> verify -> runtime.
+#
+# Legacy-builder-safe: no heredocs, no --mount, no `# syntax=` directive.
+# Only the first stage may resolve, download, compile, strip or install.
+# The runtime stage is a copy of a verified tree plus a handful of apt packages.
+
+ARG BASE=ubuntu:24.04
+ARG BUILDER=python:3.12-slim
+
+# ---------------------------------------------------------------------------
+# Stage 1: pkg. Build-time only. Nothing here survives into the runtime image.
+# ---------------------------------------------------------------------------
+FROM ${BUILDER} AS pkg
+
+ARG RULE=vllm
+ARG TARGET_ARCH=linux-x86_64
+ARG CUDA_ARCH=auto
+ARG PACKAGING=thin
+ARG SOURCE_DATE_EPOCH=1600000000
+
+WORKDIR /pkg
+
+COPY packaging/ /pkg/packaging/
+
+# Two packaging variants reach the same tree by different routes:
+#   engine -- selects from a tree that is already installed
+#   thin   -- installs a hash-pinned lock into an isolated environment, then selects
+# The image records which route produced it, so a size number is attributable.
+
+# Lock generation is a build-time step. Locks are generated artifacts, not
+# committed files: a lock is only meaningful together with the wheelhouse it
+# was hashed from.
+RUN python3 /pkg/packaging/lock.py \
+      --rule ${RULE} --target ${TARGET_ARCH} \
+      --out /pkg/locks --wheelhouse /pkg/wheelhouse --download
+
+RUN python3 /pkg/packaging/package_thin.py \
+      --lock /pkg/locks/vllm-${TARGET_ARCH}.txt \
+      --wheelhouse /pkg/wheelhouse \
+      --rule ${RULE} --out /pkg/stage \
+      --arch ${CUDA_ARCH}
+
+# ---------------------------------------------------------------------------
+# Stage 2: verify. Re-hash the staged tree against its manifest, then gate it.
+# A gate failure here stops the build; it is not a warning.
+# ---------------------------------------------------------------------------
+FROM ${BUILDER} AS verify
+
+ARG RULE=vllm
+
+WORKDIR /pkg
+
+COPY packaging/ /pkg/packaging/
+COPY --from=pkg /pkg/stage /opt/vllm/
+
+RUN python3 /pkg/packaging/package.py --verify /opt/vllm
+RUN python3 /pkg/packaging/libdeps.py /opt/vllm
+RUN python3 /pkg/packaging/lock.py --rule ${RULE} --check \
+      --out /pkg/locks --wheelhouse /pkg/wheelhouse
+
+# Import smoke on the pruned tree: a prune that removes something the package
+# needs at import time is a bug in the rule, and this is where it shows up.
+RUN PYTHONPATH=/opt/vllm python3 -c "import vllm; print(vllm.__version__)"
+
+# ---------------------------------------------------------------------------
+# Stage 3: runtime. No compiler, no pip, no git, no downloader (gate R01).
+# ---------------------------------------------------------------------------
+FROM ${BASE} AS runtime
+
+ARG RULE=vllm
+ARG VERSION=dev
+ARG PACKAGING=thin
+
+ENV PYTHONPATH=/opt/vllm
+ENV VLLM_USE_PRECOMPILED=0
+ENV VLLM_ENTRY_MODULE=vllm.entrypoints.cli.main
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g libstdc++6 numactl \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY --from=verify /opt/vllm /opt/vllm/
+COPY docker/entrypoint.sh docker/healthcheck.sh /opt/vllm-tools/
+RUN chmod 755 /opt/vllm-tools/entrypoint.sh /opt/vllm-tools/healthcheck.sh
+
+LABEL org.opencontainers.image.title="vllm-slim" \
+      org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.base.name="${BASE}" \
+      io.github.vllm-docker-engine.packaging="${PACKAGING}"
+
+VOLUME ["/root/.cache/huggingface"]
+EXPOSE 8000
+
+USER 1000:1000
+STOPSIGNAL SIGTERM
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=180s --retries=3 \
+      /opt/vllm-tools/healthcheck.sh
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/opt/vllm-tools/entrypoint.sh"]
+CMD ["--model", "Qwen/Qwen3.5-0.8B"]
