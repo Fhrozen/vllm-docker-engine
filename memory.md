@@ -48,6 +48,8 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | first build, hard gate | printed nothing: `bytecode: pyc-only` removes the `.py` files from the shipped tree, so `pkg.rglob("*.py")` found no files and the gate passed on an empty set. The scan now takes the selection (`package.select`) and reads the source tree, so the chosen files are scanned whichever form they ship in |
 | `gate` on `packaging/importscan.py` `packaging/package_thin.py` `tools/check_dist_gate.py` `tests/test_packaging.py` | clean |
 | `gate` on `docker/build.sh` | clean |
+| `gate` on `docs/findings.md` `docs/SIZES.md` `docs/DOCKER.md` `README.md` `Plan.md` `memory.md` `wiki.md` `.github/instructions/packaging.instructions.md` `tools/check_loader_paths.py` | first run FAILED: 8 MD013 line-length issues (5 in `docs/findings.md` table rows, 1 in `docs/DOCKER.md`, 1 in `docs/SIZES.md`, plus the same file re-checked after rewrap). After rewrapping: clean. markdownlint skipped `Plan.md`, `memory.md`, `wiki.md` and the instructions file as outside the gated pattern |
+| `test` re-run after the loader docs pass | 92 passed, exit 0 |
 | module-level import scan of the clone | `huggingface_hub` 12, `torchvision` 10, `flashinfer` 7, `torchaudio` 3, `ninja` 0, `sentencepiece` 0, `setuptools` 0, `model-hosting-container-standards` 0 |
 | `build --variant engine` | failed at stage 1: `ModuleNotFoundError: No module named 'importscan'` — the context is built from `git ls-files`, which lists tracked files only, so the new `packaging/importscan.py` was not in the context |
 
@@ -285,6 +287,43 @@ Bugs the container run exposed:
 - A shellcheck directive inside a `\` continuation is a parse error; it must come
   before the command.
 
+### The dynamic linker path, measured (`tools/check_loader_paths.py`)
+
+Counts edges as *cache-or-env*: a `DT_NEEDED` name is covered if it is in the
+ld.so cache, in `LD_LIBRARY_PATH`, in the tree by file name, system, or driver.
+That is what a real loader does, so it is stricter than `uncovered()`.
+
+- 305 cache-or-env edges, **14 missing**, 1,590 system, 7 driver.
+- RUNPATH: 367 ELF files with a dynamic section, 65 with RUNPATH/RPATH, **54 use
+  `$ORIGIN`**. `torch/lib/*.so` all carry `$ORIGIN/../../nvidia/*/lib`. `vllm/_C.abi3.so`
+  has **no RUNPATH**.
+- `ctypes.CDLL(vllm/_C.abi3.so)` before torch → fails on `libtorch.so`.
+- `import vllm` on a plain `ubuntu:24.04` → OK (0.17.0), `vllm._C` loaded, because
+  torch is imported first and its RUNPATH covers the wheel folders.
+- `ctypes.CDLL` after torch → fails only on `libcuda.so.1` (the driver, never bundled).
+- `ldconfig` with a `ld.so.conf.d/vde-tree.conf` for the 41 lib/`.libs` folders:
+  cache 6.8 KB → 20.0 KB (+13.2 KB, conf 3,169 bytes); direct load then fails only
+  on the driver.
+- `patchelf --set-rpath` on a copy of `vllm/_C.abi3.so`: load then fails only on the
+  driver. patchelf footprint measured as tiny (690 bytes reported by the probe).
+- Verdict: the CUDA base image is **not** required at runtime. Its value is the
+  `ld.so.conf.d` cache, not the libraries. Runtime needs the driver plus the wheel
+  libraries, with one of: import torch first, a cache entry + `ldconfig`, or a
+  RUNPATH rewrite. The devel image is a build-stage toolchain only.
+- Base images (on disk / download): `ubuntu:24.04` 0.07/0.18 GB, `12.8.1-base`
+  0.28/0.19, `12.8.1-runtime` 3.17/3.97, `13.3.0-base` 0.53/0.51, `13.3.0-runtime`
+  2.22/3.03, `12.8.1-devel` 8.75/6.89 (over budget alone), `python:3.12-slim` 0.34.
+- ld.so cache entries: `ubuntu:24.04` 83, `12.8.1-base` 91 (`000_cuda.conf`,
+  `988_cuda-12.conf`, `nvidia.conf`), `13.3.0-base` 91 (`987_cuda-13.conf`). A plain
+  base has no CUDA entries.
+- CUDA tag vs driver: driver 580.95.05 reports CUDA 13.0. `13.0.0-base` starts;
+  `13.1.0-base` and `13.3.0-base` fail with `unsatisfied condition: cuda>=13.1` /
+  `>=13.3`. `13.3.0-base/runtime/devel-ubuntu24.04` exist on the registry. The default
+  `12.8.1-devel-ubuntu24.04` matches the cu12 wheelhouse, not the driver ceiling.
+- cutlass-dsl ships **both** `cu12/lib/libcute_dsl_runtime.so` (41.6 MB) and
+  `cu13/lib/…` (41.6 MB); `CUDA_VERSION.major` resolves to 13 here, so the cu12 copy is
+  dead weight. Open prune.
+
 | Image | Size (on disk) | Compressed download | Cold start | tokens/s | Peak GPU MiB |
 | --- | --- | --- | --- | --- | --- |
 | `vllm/vllm-openai:latest` (baseline) | — | — | — | — | — |
@@ -306,6 +345,8 @@ Bugs the container run exposed:
   it issues `docker build` / `docker run` and every gate, test and measurement runs
   inside the pinned tools container (`docker/Dockerfile.tools`). Content moves
   between images, code does not run on the host.
+- Experimental research repo: when a decision is not clear, evaluate both options
+  and select from the results. Open decisions are listed in `docs/findings.md`.
 
 ## Dead ends
 
@@ -336,3 +377,10 @@ Bugs the container run exposed:
    is re-run.
 6. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
    `bash docker/run.sh script tools/compare_packaging.py`.
+7. Decide the loader path for the runtime image (mechanism measured above): import
+   order alone, a `ld.so.conf.d` entry + `ldconfig`, or a build-time RUNPATH rewrite.
+   Import order is the cheapest and works for the serving path; the cache entry is the
+   only option that survives a direct `ctypes.CDLL`. Evaluate both and pick from the
+   run, per the repo rule.
+8. Decide the CUDA version the image declares: driver ceiling (13.0) vs wheelhouse
+   (cu12). This decides whether the cutlass-dsl cu12 duplicate (41.6 MB) is pruned.

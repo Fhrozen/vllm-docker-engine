@@ -129,6 +129,67 @@ stage compiled. Measured in the container:
 
 The decision this produces is recorded in `Plan.md` finding 5.
 
+### The loader path, measured
+
+Files being present in the tree is not the same as the loader finding them.
+`libdeps.uncovered()` checks that a `DT_NEEDED` name exists somewhere by file
+name; `tools/check_loader_paths.py` counts edges as *cache-or-env*, which is what
+a real loader does. Measured against the installed tree, with no
+`LD_LIBRARY_PATH` and no cache entry for the tree:
+
+- 305 cache-or-env edges, **14 missing**, 1,590 system, 7 driver.
+- RUNPATH: 367 ELF files with a dynamic section, 65 with RUNPATH/RPATH, **54 use
+  `$ORIGIN`**. Every `torch/lib/*.so` carries
+  `$ORIGIN/../../nvidia/*/lib`; `vllm/_C.abi3.so` has none.
+- `ctypes.CDLL(vllm/_C.abi3.so)` before torch → fails on `libtorch.so`.
+- `import vllm` on a plain `ubuntu:24.04` → works, `vllm._C` loaded, because
+  torch is imported first and its RUNPATH covers the wheel folders.
+- `ctypes.CDLL` after torch → fails only on `libcuda.so.1`, the driver.
+- `ldconfig` with a `ld.so.conf.d` entry for the 41 lib/`.libs` folders: cache
+  6.8 KB → 20.0 KB (+13.2 KB, conf 3,169 bytes); direct load then fails only on
+  the driver.
+- `patchelf --set-rpath` on a copy of `vllm/_C.abi3.so`: load then fails only on
+  the driver. patchelf footprint measured as tiny (690 bytes by the probe).
+
+So the CUDA base image is not required at runtime: its value is the
+`ld.so.conf.d` cache, not the libraries. The runtime stage needs the driver plus
+the wheel libraries and one of three loader fixes. The verdict is in `Plan.md`
+finding 6 and `docs/findings.md`.
+
+## Base images measured
+
+On disk / compressed download, from `docker image inspect` and
+`docker manifest inspect`:
+
+| Image | On disk | Download |
+| --- | --- | --- |
+| `ubuntu:24.04` | 0.07 GB | 0.18 GB |
+| `nvidia/cuda:12.8.1-base-ubuntu24.04` | 0.28 GB | 0.19 GB |
+| `nvidia/cuda:12.8.1-runtime-ubuntu24.04` | 3.17 GB | 3.97 GB |
+| `nvidia/cuda:13.3.0-base-ubuntu24.04` | 0.53 GB | 0.51 GB |
+| `nvidia/cuda:13.3.0-runtime-ubuntu24.04` | 2.22 GB | 3.03 GB |
+| `nvidia/cuda:12.8.1-devel-ubuntu24.04` | 8.75 GB | 6.89 GB |
+| `python:3.12-slim` | — | 0.34 GB |
+
+A CUDA runtime base is over the 4 GB budget on its own, which is the strongest
+argument for a plain base plus pip wheels. Largest files in
+`12.8.1-runtime`: libcublasLt 716.9 MB, libcusparse 368.7 MB, libnccl 365.8 MB.
+
+ld.so cache entries: `ubuntu:24.04` 83 (`libc.conf`, `x86_64-linux-gnu.conf`);
+`12.8.1-base` 91 (`000_cuda.conf`, `988_cuda-12.conf`, `nvidia.conf`);
+`13.3.0-base` 91 (`000_cuda.conf`, `987_cuda-13.conf`, `nvidia.conf`). A plain
+base has no CUDA entries — which is exactly the gap the loader measurements above
+fill another way.
+
+Driver ceiling: 580.95.05, reported CUDA 13.0. `13.0.0-base` starts on this host;
+`13.1.0-base` and `13.3.0-base` are refused by nvidia-container-toolkit. The
+wheelhouse is cu12, so the build-stage toolchain stays on 12.8.1.
+
+Duplicate tree: `nvidia_cutlass_dsl` ships `cu12/lib/libcute_dsl_runtime.so`
+(41.6 MB) and `cu13/lib/libcute_dsl_runtime.so` (41.6 MB). `CUDA_VERSION.major`
+resolves to 13 in this environment, so the cu12 copy is dead weight — open prune,
+pending the CUDA-version decision.
+
 ## What the measurements changed
 
 - **flashinfer-cubin is dead weight for this GPU.** 1,114.8 MB unpacked

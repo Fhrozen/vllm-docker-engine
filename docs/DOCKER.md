@@ -84,6 +84,43 @@ non-empty `data`.
 number is comparable between runs. It fails if the response has no completion
 tokens.
 
+## The base image question, answered
+
+Two questions were asked, and both were answered by running rather than by
+assuming.
+
+**Why `nvidia/cuda:12.8.1-devel-ubuntu24.04` and not 13.3.** The tag is capped by
+the driver, not by the registry. The host driver is 580.95.05 and reports CUDA
+13.0. Running the images: `13.0.0-base-ubuntu24.04` starts, `13.1.0-base` and
+`13.3.0-base` fail with `nvidia-container-cli: requirement error: unsatisfied
+condition: cuda>=13.1` / `>=13.3`. The 13.3 tags do exist on the registry, so the
+default is not chosen because 13.3 is unavailable — it is chosen because it
+matches the CUDA 12.8 libraries the rule actually ships. torch 2.10.0 pins every
+`nvidia-*` dependency to cu12 (`nvidia-cuda-runtime-cu12==12.8.90`,
+`nvidia-cudnn-cu12==9.10.2.21`, `nvidia-nccl-cu12==2.27.5`), and
+`cuda-bindings==12.9.4`. A base image that declares a newer CUDA than the driver
+can run is a build that will not start. The devel variant is used only as a
+**build-stage toolchain** (nvcc, compiler); it is never a runtime base, and it is
+8.75 GB on disk, which is over the budget on its own.
+
+**Is the CUDA base image required at all, since pip installs the nvidia
+libraries?** No, not at runtime. What a CUDA base image contributes is its
+`ld.so.conf.d` cache, not its libraries. Measured against the installed tree with
+no `LD_LIBRARY_PATH` and no cache entry: `ctypes.CDLL` on `vllm/_C.abi3.so` before
+torch fails on `libtorch.so`, while `import vllm` on a plain `ubuntu:24.04` works,
+because torch is imported first and every `torch/lib/*.so` carries a
+`$ORIGIN/../../nvidia/*/lib` RUNPATH covering the wheel folders. `vllm/_C.abi3.so`
+has no RUNPATH of its own. So the runtime image needs one of three things: torch
+imported first (true for the serving path), a `ld.so.conf.d` entry plus `ldconfig`
+(3.2 KB config, 13.2 KB cache), or a RUNPATH rewrite at build time. Only the
+driver — never bundled — is still required, and after torch is loaded the only
+missing library is `libcuda.so.1`.
+
+This is why the runtime stage stays on a plain base: `ubuntu:24.04` is 0.07 GB on
+disk, a CUDA base is 0.28 GB (cu12) or 0.53 GB (cu13), and a CUDA runtime image
+is 2.22–3.17 GB — over the 4 GB budget before anything is added. The loader path
+is an open decision, recorded in `docs/findings.md`.
+
 ## Verified
 
 Recorded from runs inside the container:

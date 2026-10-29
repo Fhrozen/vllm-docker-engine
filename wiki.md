@@ -35,6 +35,10 @@ This repo owns only: `packaging/`, `docker/`, `tools/`, `docs/`, and the root fi
     issues only `docker build` / `docker run`. Every gate, test, measurement and script runs inside
     the pinned tools container (`docker/Dockerfile.tools`). Content may move between images; project
     code never runs in the local shell.
+11. **This is an experimental research repo.** If a decision is not clear, evaluate both
+    options and select from the results. A decision stays open until both branches have
+    been run, and each branch records the command that produced its number. Open
+    decisions are listed in `docs/findings.md`.
 
 ## Layout
 
@@ -103,6 +107,13 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   on the target arch and ship it.
 - Forbidden suffixes in the shipped tree: `.a`, `.o`, `.cmake`, plus `pkgconfig/` and dev headers —
   except when the `.pyc`-only mode is *not* chosen, in which case `.py` is allowed by rule.
+- Files being present in the tree is not the same as the loader finding them. `uncovered()`
+  checks that a `DT_NEEDED` name exists somewhere by file name; it does not check that
+  `ld.so` can resolve it. The value of a CUDA base image is its `ld.so.conf.d` cache, not
+  its libraries. Either torch is imported first (its `$ORIGIN/../../nvidia/*/lib` RUNPATH
+  covers the wheel folders), or the image needs a `ld.so.conf.d` entry plus `ldconfig`, or
+  a RUNPATH rewrite at build time. `vllm/_C.abi3.so` has no RUNPATH of its own, so a direct
+  `ctypes.CDLL` on it fails before torch is imported.
 
 ## Docker conventions
 

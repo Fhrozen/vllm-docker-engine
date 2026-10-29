@@ -20,7 +20,10 @@ include: ["packaging/**", "docker/**", "tools/**", "tests/**"]
   part of a build identity.
 - Gates must receive the changed files explicitly. A gate with no arguments
   renders nothing and exits 0, which looks like a pass and is not one.
-- No claim without a measurement. Reproducibility claims require a comparison
+- No claim without a measurement.
+- This is an experimental research repo: if a decision is not clear, evaluate both
+  options and select from the results. A decision stays open until both branches
+  have been run, and each branch records the command that produced its number. Reproducibility claims require a comparison
   run, not a reasoning step.
 - GPU only. CPU-only paths are out of scope.
 - Hashing happens after strip and bytecode, so the manifest describes the

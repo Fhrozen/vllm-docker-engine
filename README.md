@@ -15,6 +15,7 @@ This repo holds only the packaging and docker layer. `vllm/`, `vllm-omni/` and
 | `docs/PACKAGING.md` | How a package is built, verified and archived |
 | `docs/DOCKER.md` | Image layout, gates, build and run |
 | `docs/SIZES.md` | Measured sizes and speed, per variant |
+| `docs/findings.md` | Findings so far, open decisions, how decisions are made |
 
 ## Layout
 

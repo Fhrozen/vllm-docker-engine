@@ -4,6 +4,13 @@ Read `wiki.md` first for the machine-facing rules. Progress and measurements go 
 and `docs/SIZES.md`. Never state a size, a speed, or a reproducibility claim without a measured
 number from this repo's own harness.
 
+## Decision rule
+
+This is an experimental research repo. **When a decision is not clear, evaluate
+both options and select from the results.** A decision stays open until both
+branches have been run, and each branch records the command that produced its
+number. Findings so far are collected in `docs/findings.md`.
+
 ## Target
 
 - Deliverable: a **vLLM slim GPU image** (+ optional `vllm-omni` overlay image).
@@ -57,15 +64,34 @@ number from this repo's own harness.
    arch, so the build stage must warm it on the target arch and ship it. Minimum measured warm
    cache: 10 files / 0.07 MB. **Open decision:** ship a build-stage-warmed cache (R01 stands),
    or relax R01 for the runtime image. Numbers in `docs/SIZES.md`.
+6. **The CUDA base image is not required at runtime.** Its value is the dynamic
+   linker configuration, not the libraries — the libraries come from the pip
+   wheels. Measured with no `LD_LIBRARY_PATH` and no cache entry for the tree:
+   `ctypes.CDLL(vllm/_C.abi3.so)` before torch fails on `libtorch.so`; `import
+   vllm` on a plain `ubuntu:24.04` works because torch is imported first and every
+   `torch/lib/*.so` carries a `$ORIGIN/../../nvidia/*/lib` RUNPATH; a
+   `ld.so.conf.d` entry (3.2 KB config, 13.2 KB cache) or a RUNPATH rewrite makes
+   a direct load work. `vllm/_C.abi3.so` has no RUNPATH of its own. Of 367 ELF
+   files with a dynamic section, 65 have RUNPATH/RPATH, 54 use `$ORIGIN`. The devel
+   image is a **build-stage toolchain only**; the runtime stage needs the driver
+   (never bundled) plus the wheel libraries. Details in `docs/findings.md`.
+7. **The CUDA tag is capped by the driver.** Host driver 580.95.05 reports CUDA
+   13.0. `13.0.0-base-ubuntu24.04` starts; `13.1.0` and `13.3.0` fail with
+   `unsatisfied condition: cuda>=13.1` / `>=13.3`, even though those tags exist on
+   the registry. The default `12.8.1-devel-ubuntu24.04` is chosen because it
+   matches the cu12 wheelhouse (torch 2.10.0 pins every `nvidia-*` dependency to
+   cu12), not because 13.3 is unavailable.
 
 ## Phases
 
 - **Phase 1 — research & audit.** Baseline measurement, base-image matrix, dependency
   classification into `packaging/rules/vllm.json`, arch detection, JIT-toolchain decision,
   torch-subset spike (documents the negative result).
-- **Phase 2 — docker build spikes.** Control / pruned / lock-only spikes; confirm torch resolves
-  `nvidia-*` libs without the CUDA base's ldconfig entries; prune pass (`strip`, `.a`, `pkgconfig`,
-  headers, `tests/`); bytecode variants side by side; `tools/compare_packaging.py` picks the default.
+- **Phase 2 — docker build spikes.** Control / pruned / lock-only spikes; the loader
+  check is already confirmed (finding 6: torch's `$ORIGIN` RUNPATH resolves the
+  `nvidia-*` libs on a plain base, so no CUDA base image is needed at runtime);
+  prune pass (`strip`, `.a`, `pkgconfig`, headers, `tests/`); bytecode variants side
+  by side; `tools/compare_packaging.py` picks the default.
 - **Phase 3 — vLLM slim image.** `packaging/package.py` + `package_thin.py`, `docker/Dockerfile.vllm`
   (pkg → verify → runtime), entrypoint/healthcheck/smoke-test, compose.
 - **Phase 3b — harness.** `tools/measure.sh`: image size, compressed download, cold start,
