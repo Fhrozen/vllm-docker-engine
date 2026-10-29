@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "id": "vllm-omni-slim",
+  "name": "vllm-omni",
+  "version": "auto",
+  "platform": "linux-x86_64",
+  "backend": "cuda",
+  "entrypoint": "vllm-omni serve",
+  "python": "3.12",
+  "overlay_on": "vllm-slim",
+  "requirements": {
+    "clone": "vllm-omni",
+    "files": ["requirements/common.txt", "requirements/cuda.txt"]
+  },
+  "allow": ["vllm_omni/**", "*.dist-info/**"],
+  "deny": [
+    "pip",
+    "setuptools",
+    "wheel",
+    "pre-commit",
+    "ruff",
+    "mypy",
+    "pytest",
+    "build",
+    "ninja",
+    "cmake"
+  ],
+  "prune": [
+    "**/tests/**",
+    "**/test/**",
+    "**/docs/**",
+    "**/doc/**",
+    "**/examples/**",
+    "**/benchmarks/**",
+    "**/recipes/**",
+    "**/scripts/**",
+    "**/tools/**",
+    "**/*.pyi",
+    "**/*.pyx",
+    "**/*.map",
+    "**/*.ipynb",
+    "**/test-data/**",
+    "**/testdata/**"
+  ],
+  "bytecode": "pyc-only",
+  "strip": false,
+  "arch_filter": "auto",
+  "system_libs": [],
+  "driver_libs": [
+    "libcuda.so.1",
+    "libnvidia-ml.so.1"
+  ],
+  "runtime_apt": [],
+  "forbidden_tools": [
+    "cc",
+    "gcc",
+    "g++",
+    "cmake",
+    "ninja",
+    "nvcc",
+    "ld",
+    "pip",
+    "uv",
+    "git",
+    "curl",
+    "wget"
+  ],
+  "entry_points": {
+    "vllm.general_plugins": "vllm_omni.engine.arg_utils:register_omni_models_to_vllm"
+  }
+}
