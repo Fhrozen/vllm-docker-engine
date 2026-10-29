@@ -32,6 +32,15 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | determinism (two builds, two out folders) | byte-identical archives |
 | `test` (70 tests) | exit 0, all passed |
 | `test` (71 tests) | exit 0, all passed |
+| `test` (73 tests) | exit 0, all passed |
+| `test` (74 tests) | exit 1, 2 failed — `runtime_conflicts` resolved a file's owner from its first path segment instead of the `RECORD` map, so a package importing its own submodules counted as a conflict, and the first fixture had no `RECORD` for the denied dist |
+| `test` (76 tests) | exit 0, all passed after the ownership fix |
+| `test` (77 tests) | exit 0, all passed after the selection fix |
+| first build, hard gate | printed nothing: `bytecode: pyc-only` removes the `.py` files from the shipped tree, so `pkg.rglob("*.py")` found no files and the gate passed on an empty set. The scan now takes the selection (`package.select`) and reads the source tree, so the chosen files are scanned whichever form they ship in |
+| `gate` on `packaging/importscan.py` `packaging/package_thin.py` `tools/check_dist_gate.py` `tests/test_packaging.py` | clean |
+| `gate` on `docker/build.sh` | clean |
+| module-level import scan of the clone | `huggingface_hub` 12, `torchvision` 10, `flashinfer` 7, `torchaudio` 3, `ninja` 0, `sentencepiece` 0, `setuptools` 0, `model-hosting-container-standards` 0 |
+| `build --variant engine` | failed at stage 1: `ModuleNotFoundError: No module named 'importscan'` — the context is built from `git ls-files`, which lists tracked files only, so the new `packaging/importscan.py` was not in the context |
 
 ### Build runs
 
@@ -63,6 +72,80 @@ What the runs showed:
 - `--find-links` alone did not keep the install local: pip still fetched from the
   index. `--no-index` makes the wheelhouse the only source, so a missing wheel fails
   loudly instead of quietly reaching the network.
+- The requirement set covered only dependencies, so the package being packaged was
+  never installed and `resolve_version` had nothing to read:
+  `version: auto but no dist-info for vllm`. `requirements_for` now includes the rule's
+  own package, and refuses a rule that denies its own name. Measured inside the
+  container that both resolve to binary wheels for the target:
+  `vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl`,
+  `vllm_omni-0.32.0-py3-none-any.whl`.
+- `pip download` resolves the whole transitive graph, so a rule-denied name re-enters
+  the lock through a dependency: `setuptools` is denied by the rule yet was downloaded
+  as a dependency of `model-hosting-container-standards`. New gate
+  `denied_dependencies()` reports a denied name required at runtime by a shipped
+  package — unmarked requirements only, since extras are not installed and an
+  environment marker cannot be evaluated without the `packaging` library.
+- `denied_dependencies()` is the weak half of the gate: a declared requirement is
+  not an import, so it reports and does not fail. `importscan.runtime_conflicts`
+  is the half that can fail, by reading the shipped files. `package_thin.build()`
+  now prints the declared half and fails on the hard half (a shipped file that
+  imports a denied package at module scope); imports inside a function, `try`, or
+  `if` are not executed at import time, so a denied name reached only through
+  those stays optional as the rule intends.
+- Ownership is read from each distribution's `RECORD`, not guessed from a package
+  name: `flashinfer-python` owns `flashinfer/`, `opencv-python-headless` owns
+  `cv2/`. A distribution is not a conflict with itself, and a file's owner comes
+  from the same map — that was the bug in the first version of the gate.
+- `build.sh` lists the context with `git ls-files --cached --others
+  --exclude-standard`. Tracked files alone silently drop a new module from the
+  image build, which is how the first build failed.
+- The deny list contradicts the clone's own requirements. Measured by module-level
+  import scan of the clone: `huggingface_hub` 12 (including `engine/arg_utils.py`,
+  the serve path), `torchvision` 10, `flashinfer` 7, `torchaudio` 3, and
+  `ninja`, `sentencepiece`, `setuptools`,
+  `model-hosting-container-standards` 0. So `huggingface_hub` must ship, the three
+  feature modules need their package denied-or-shipped decided, and the
+  zero-import names can stay denied.
+- Name-only requirements record what pip resolved, not what the clone pins: the
+  clone declares `torch==2.13.0`, `torchaudio==2.11.0`, `torchvision==0.28.0`,
+  `flashinfer-python==0.7.0.post1`, while the wheelhouse held `torch 2.10.0`,
+  `torchaudio 2.10.0`, `torchvision 0.25.0`, `flashinfer_python 0.6.6`. The pins
+  are dropped by `read_requirements()`; whether the resolved versions are
+  acceptable is not yet measured.
+- First full build reached the uncovered gate and failed with 14 entries:
+  `numba/np/ufunc/omppool...so: libgomp.so.1.0.0`,
+  `numba/np/ufunc/tbbpool...so: libtbb.so.12`,
+  `nvidia/cufile/lib/libcufile_rdma.so.1: libmlx5.so.1 / librdmacm.so.1 /
+  libibverbs.so.1`, and the nvshmem plugin/bootloader set
+  (`nvshmem_bootstrap_mpi.so.3: libmpi.so.40`, `..._pmix.so.3: libpmix.so.2`,
+  `..._shmem.so.3: liboshmem.so.40`, `..._ibdevx/ibgda.so.3: libmlx5.so.1`,
+  `..._libfabric.so.3: libfabric.so.1`, `..._ucx.so.3: libucs.so.0 / libucp.so.0`).
+  These are optional runtime plugins, so the choice is to prune them or to declare
+  their libraries as system libraries. `libgomp` is installed by `runtime_apt` but
+  is not in the `SYSTEM_LIBS` glob, and `nvidia/cufile/**` is not in the prune list.
+- `strip: tool unavailable, skipping` in the pkg stage: the builder base has no
+  binutils, so the strip step in the pipeline does nothing there. `strip` exists in
+  the tools image only. Decide whether to add binutils to the pkg stage or drop
+  strip from the pipeline.
+- Anomaly to measure: the declared half printed nothing on the first full build,
+  even though shipped packages declare denied names. No claim until a run shows why.
+  Part of it is now explained by ordering: `build()` fails on the hard half before it
+  prints the declared half, so a failing hard half never prints the declared one.
+- Second build (scan reads the selection): the hard gate fired with **957 findings**,
+  counted from the log by denied name —
+  `huggingface-hub` 769, `torchvision` 157, `setuptools` 14,
+  `flashinfer-python` 8, `sentencepiece` 5, `torchaudio` 4;
+  by owning package — `transformers` 906, `vllm` 34, `numba` 6,
+  `flashinfer` 5, `torch` 2, `llguidance` 1, `compressed_tensors` 1,
+  top-level `build_backend.py` 1.
+  The deny list contradicts the shipped tree at scale: `transformers` imports
+  `huggingface_hub` at module level in 769 files and `torchvision` in 157, so both
+  must ship. The earlier clone-only scan (12 / 10) counted only vLLM's own files and
+  understated this by an order of magnitude.
+  `setuptools` (14) is reached only through build-time paths —
+  `torch/utils/cpp_extension.py`, `numba/pycc/**`, `flashinfer/data/**` setup
+  scripts, `build_backend.py` — so those files are prune candidates rather than a
+  reason to ship setuptools.
 
 Other defects found and fixed by running:
 

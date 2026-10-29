@@ -19,6 +19,7 @@ from conftest import REPO, rule, tree
 import arch
 import check_dist_gate
 import check_files
+import importscan
 import libdeps
 import package
 import rules
@@ -500,7 +501,113 @@ def test_requirements_snapshot_needs_no_clone_and_applies_deny():
     # A build has no clone in its context, so the rule's snapshot is what the
     # build resolves. Denied names are dropped because they are never shipped.
     r = rule(requirements={"clone": "vllm", "names": ["zeta", "bar", "alpha"]})
-    assert lock_mod.requirements_for(r) == ["alpha", "zeta"]
+    # The package being packaged is part of the set: without it the installed
+    # tree has no dist-info for resolve_version to read.
+    assert lock_mod.requirements_for(r) == ["alpha", "foo", "zeta"]
+
+
+def test_rule_denying_its_own_package_is_refused():
+    r = rule(requirements={"clone": "vllm", "names": ["alpha"]}, deny=["foo"])
+    try:
+        lock_mod.requirements_for(r)
+    except SystemExit as exc:
+        assert "denies its own package" in str(exc)
+    else:
+        raise AssertionError("a rule cannot deny the package it ships")
+
+
+def test_denied_dependencies_reports_a_runtime_conflict(tmp_path):
+    sp = tmp_path / "venv" / "lib" / "python3.12" / "site-packages"
+    shipped = sp / "shipped-1.0.dist-info"
+    shipped.mkdir(parents=True)
+    (shipped / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: shipped\n"
+        "Requires-Dist: pip\n"
+        "Requires-Dist: numpy>=1.2\n"
+        "Requires-Dist: setuptools ; extra == 'test'\n"
+    )
+    denied = sp / "gone-1.0.dist-info"
+    denied.mkdir(parents=True)
+    (denied / "METADATA").write_text("Requires-Dist: pip\n")
+    r = rule(deny=["pip", "gone"])
+    # only an unmarked requirement of a shipped package counts: extras are not
+    # installed, and a denied package's own requirements never reach runtime
+    assert package_thin.denied_dependencies(tmp_path / "venv", r) == [
+        "pip (required by shipped)"
+    ]
+
+
+def test_top_level_map_maps_import_names_through_record(tmp_path):
+    sp = tmp_path / "site-packages"
+    record = sp / "flashinfer_python-0.6.6.dist-info" / "RECORD"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        "flashinfer/decode.py,,\nflashinfer_python-0.6.6.dist-info/METADATA,,\n"
+    )
+    cv2 = sp / "opencv_python_headless-5.0.dist-info" / "RECORD"
+    cv2.parent.mkdir(parents=True)
+    cv2.write_text("cv2/__init__.py,,\n")
+    # the mapping is read from what the wheel installs, not guessed from the name
+    assert importscan.top_level_map(sp) == {
+        "flashinfer": "flashinfer-python",
+        "cv2": "opencv-python-headless",
+    }
+
+
+def test_runtime_conflicts_only_count_imports_at_module_level(tmp_path):
+    sp = tmp_path / "site-packages"
+    (sp / "shipped-1.0.dist-info").mkdir(parents=True)
+    (sp / "shipped-1.0.dist-info" / "RECORD").write_text("shipped/x.py,,\n")
+    (sp / "flashinfer_python-0.6.6.dist-info").mkdir(parents=True)
+    (sp / "flashinfer_python-0.6.6.dist-info" / "RECORD").write_text(
+        "flashinfer/decode.py,,\n"
+    )
+    pkg = tree(
+        tmp_path / "pkg",
+        {
+            "shipped/x.py": "import flashinfer\n\ndef f():\n    import cv2\n",
+        },
+    )
+    r = rule(deny=["flashinfer-python", "cv2"])
+    assert importscan.runtime_conflicts(pkg, r, importscan.top_level_map(sp)) == [
+        "shipped/x.py: imports flashinfer at module level, but flashinfer-python is denied"
+    ]
+
+
+def test_runtime_conflicts_ignore_a_package_importing_itself(tmp_path):
+    sp = tmp_path / "site-packages"
+    (sp / "flashinfer_python-0.6.6.dist-info").mkdir(parents=True)
+    (sp / "flashinfer_python-0.6.6.dist-info" / "RECORD").write_text(
+        "flashinfer/decode.py,,\n"
+    )
+    pkg = tree(
+        tmp_path / "pkg", {"flashinfer/decode.py": "from flashinfer import utils\n"}
+    )
+    r = rule(deny=["flashinfer-python"])
+    assert importscan.runtime_conflicts(pkg, r, importscan.top_level_map(sp)) == []
+
+
+def test_scan_uses_the_selection_when_bytecode_removes_the_source(tmp_path):
+    sp = tmp_path / "site-packages"
+    (sp / "shipped-1.0.dist-info").mkdir(parents=True)
+    (sp / "shipped-1.0.dist-info" / "RECORD").write_text("shipped/x.py,,\n")
+    (sp / "flashinfer_python-0.6.6.dist-info").mkdir(parents=True)
+    (sp / "flashinfer_python-0.6.6.dist-info" / "RECORD").write_text(
+        "flashinfer/decode.py,,\n"
+    )
+    src = tree(sp, {"shipped/x.py": "import flashinfer\n"})
+    r = rule(deny=["flashinfer-python"], bytecode="pyc-only")
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert "shipped/x.py" in selected
+
+    pkg = package.build(src, r, tmp_path / "out", ["sm_90"], archive=False)
+    assert not list(pkg.rglob("*.py"))
+    assert importscan.runtime_conflicts(pkg, r, importscan.top_level_map(sp)) == []
+    assert importscan.runtime_conflicts(
+        src, r, importscan.top_level_map(sp), selected
+    ) == [
+        "shipped/x.py: imports flashinfer at module level, but flashinfer-python is denied"
+    ]
 
 
 def test_requirements_without_snapshot_needs_the_clone():

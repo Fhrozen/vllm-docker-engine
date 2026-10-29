@@ -86,6 +86,9 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 - Gates are read from **image metadata**, not from the Dockerfile text: entrypoint, no `CMD`, uid,
   `EXPOSE`, `VOLUME`, `HEALTHCHECK`, OCI labels. Report `UNVERIFIED` rather than `OK` when a gate
   cannot be checked.
+- The build context is assembled from an allow-list (`packaging/`, `docker/`, `tools/`) through
+  `git ls-files --cached --others --exclude-standard`. Tracked files alone are not enough: a new
+  file is silently absent from the context, and the build fails at its first import.
 
 ## Environment facts (this host)
 

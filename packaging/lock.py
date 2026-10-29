@@ -54,7 +54,11 @@ HASH_LINE = re.compile(r"^\s*--hash=sha256:([0-9a-f]{64})")
 MANYLINUX = re.compile(r"^manylinux_(\d+)_(\d+)_([A-Za-z0-9_]+)$")
 # Legacy aliases still present in wheel filenames. They name the same glibc
 # floor, so `manylinux2014_x86_64` is accepted where `manylinux_2_17_x86_64` is.
-LEGACY_GLIBC = {"manylinux1": (2, 5), "manylinux2010": (2, 12), "manylinux2014": (2, 17)}
+LEGACY_GLIBC = {
+    "manylinux1": (2, 5),
+    "manylinux2010": (2, 12),
+    "manylinux2014": (2, 17),
+}
 
 # The image target. Kept explicit so a lock is never silently rebuilt for another
 # platform; a mismatch here is why hash-pinned installs fail in CI.
@@ -184,6 +188,11 @@ def requirements_for(rule: dict) -> list[str]:
     Names the rule denies are dropped. Downloading a package the rule will not
     ship is wasted work, and a lock that contains it cannot be matched by the
     shipped tree, so the deny list is applied here rather than after the fact.
+
+    The package named by the rule is part of the set as well: the thin variant
+    installs it from a binary wheel, and without it the installed tree has no
+    `*.dist-info` for `package.resolve_version` to read. The engine variant
+    builds that package from the clone, so for it this entry is a superset.
     """
     spec = rule.get("requirements")
     if isinstance(spec, str):
@@ -213,6 +222,13 @@ def requirements_for(rule: dict) -> list[str]:
     dropped = len(names) - len(kept)
     if dropped:
         print(f"requirements: {dropped} denied name(s) not downloaded")
+
+    self_name = rules_mod.norm(rule["name"])
+    if rules_mod.denied(self_name, rule):
+        raise SystemExit(
+            f"rule denies its own package: {self_name} (name={rule['name']})"
+        )
+    kept.append(self_name)
     return sorted(set(kept))
 
 

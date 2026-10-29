@@ -113,7 +113,40 @@ own floors. musllinux is rejected because the runtime base is glibc.
 run. It is best-effort: pip cannot see the target's dependency graph, so a
 conflict there is reported rather than solved.
 
-## Gates
+## The two halves of the deny gate
+
+A rule's `deny` list and a package's declared dependencies can contradict each
+other: a name can be denied while a shipped package declares it as a runtime
+requirement. That contradiction is split into two gates, because they prove
+different things.
+
+- **Declared** (`packaging/package_thin.denied_dependencies`) — reads
+  `Requires-Dist` from each shipped distribution's `METADATA` and reports a
+  denied name that a shipped package declares as a runtime requirement. This is
+  a report, not a failure: a declared dependency is not necessarily imported,
+  and the rule intends those names to be optional. Marker lines are skipped
+  because extras are never installed here, and a marker cannot be evaluated
+  without the `packaging` library.
+- **Hard** (`packaging/importscan.runtime_conflicts`) — a denied name is not
+  shipped, so if a shipped file imports it at module scope, the image breaks the
+  moment that file is imported. This fails the build. Imports inside a function,
+  a `try`, or an `if` guard are not executed at import time, so a denied name
+  reached only through those stays optional.
+
+Ownership is resolved through each distribution's `RECORD`, not by guessing a
+package name into an import name: `flashinfer-python` owns `flashinfer/`,
+`opencv-python-headless` owns `cv2/`. A distribution is not a conflict with
+itself, and a file's owner comes from the same map.
+
+The hard half scans the selection in source form, before the package is built. A
+`bytecode: pyc-only` rule removes the `.py` files the scan reads, so scanning the
+built tree finds nothing — measured on the first real build, where this gate
+printed no findings at all.
+
+The gate prints the declared half and fails on the hard half. `huggingface_hub`
+is the case that shows why the halves must be separate: it is denied as optional
+and is imported at module level on the serve path (`engine/arg_utils.py`), so it
+must ship — the rule has to change, not the build.
 
 - `verify`: hash or size drift, symlinks, files not in the manifest
 - `check_archive`: absolute paths, `..` members, non-regular members,
@@ -122,6 +155,10 @@ conflict there is reported rather than solved.
 - static gate: `.a`, `.o`, `.cmake`, `.prl` in the shipped tree
 - lock gate: a wheel not in the lock, a hash mismatch, a lock entry with
   no wheel
+- deny gate, declared half: a denied name that a shipped package declares as a
+  runtime requirement — reported, not failed
+- deny gate, hard half: a shipped file that imports a denied package at module
+  level — fails the build
 - runtime gate (`R01`): a tool in the final image, root user, no healthcheck
 
 `check_archive` verifies bytes **inside** the archive before anything is
@@ -157,3 +194,15 @@ from an estimate:
   environment's own tooling when the rule denies it (`pip` is never shipped).
 - `INSTALL_FLAGS` keeps the wheelhouse as the only install source
   (`--no-index`), so a missing wheel is an error rather than a network fetch.
+- `requirements_for()` includes the package named by the rule. A lock of
+  dependencies alone leaves no `*.dist-info` for `resolve_version` to read. Both
+  packages resolve to binary wheels for the target, measured inside the
+  container: `vllm-0.32.0-cp38-abi3-manylinux_2_28_x86_64.whl` and
+  `vllm_omni-0.32.0-py3-none-any.whl`.
+- `pip download` resolves the whole transitive graph, so a denied name can
+  re-enter the lock through a dependency — `setuptools` is denied by the rule yet
+  was downloaded as a dependency of `model-hosting-container-standards`.
+  `denied_dependencies()` reports a denied name that a shipped package still
+  requires at runtime, counting unmarked requirements only: extras are not
+  installed, and an environment marker cannot be evaluated without the
+  `packaging` library.

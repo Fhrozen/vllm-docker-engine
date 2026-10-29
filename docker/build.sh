@@ -70,7 +70,10 @@ rm -rf "$CONTEXT"
 mkdir -p "$CONTEXT"
 
 if command -v git >/dev/null 2>&1; then
-    (cd "$REPO" && git ls-files -z -- "${ALLOWED[@]}" | tar --null -T - -cf -) | (cd "$CONTEXT" && tar -xf -)
+    # --cached alone lists tracked files only, so a new file is silently missing
+    # from the context and the build fails on its first import. --others adds
+    # untracked files, --exclude-standard keeps gitignored output out of it.
+    (cd "$REPO" && git ls-files -z --cached --others --exclude-standard -- "${ALLOWED[@]}" | tar --null -T - -cf -) | (cd "$CONTEXT" && tar -xf -)
 else
     for path in "${ALLOWED[@]}"; do
         [ -d "$REPO/$path" ] || continue

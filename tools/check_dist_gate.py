@@ -26,6 +26,10 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "packaging"))
+
+import importscan  # noqa: E402
+
 CLONE = REPO / "vllm" / "vllm"
 
 # What a USE_DISTRIBUTED=0 build still exposes. Everything else is inside the
@@ -35,18 +39,7 @@ STUB_PROVIDES = ("GroupName", "ProcessGroup")
 
 def module_level_imports(path: Path) -> list[str]:
     """Import statements at module scope, i.e. executed at import time."""
-    tree = ast.parse(path.read_text(), filename=str(path))
-    found = []
-    for node in tree.body:
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name.startswith("torch.distributed"):
-                    found.append(f"import {alias.name}")
-        elif isinstance(node, ast.ImportFrom):
-            if (node.module or "").startswith("torch.distributed"):
-                names = ", ".join(alias.name for alias in node.names)
-                found.append(f"from {node.module} import {names}")
-    return found
+    return importscan.module_level_imports(path, "torch.distributed")
 
 
 def stub_distributed() -> types.ModuleType:

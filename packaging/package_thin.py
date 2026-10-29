@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import arch as arch_mod  # noqa: E402
+import importscan  # noqa: E402
 import libdeps  # noqa: E402
 import package as pkg_mod  # noqa: E402
 import rules as rules_mod  # noqa: E402
@@ -40,6 +41,8 @@ INSTALL_FLAGS = [
 
 LOCK_LINE = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)==(?P<version>[^\s\\]+)")
 HASH_LINE = re.compile(r"^\s*--hash=sha256:([0-9a-f]{64})")
+REQUIRES_LINE = re.compile(r"^Requires-Dist:\s*(?P<req>[^;]+)(?:;\s*(?P<marker>.*))?")
+NAME_PART = re.compile(r"[<>=!~;\[ ]")
 
 
 def lock_names(lock: Path) -> list[tuple[str, str]]:
@@ -130,6 +133,38 @@ def lock_diff(venv: Path, lock: Path, rule: dict) -> list[str]:
     return problems
 
 
+def denied_dependencies(venv: Path, rule: dict) -> list[str]:
+    """Denied names that a shipped package declares as a runtime dependency.
+
+    The deny list decides what ships. If a package that survives the deny list
+    still requires a denied name, the shipped tree cannot satisfy itself for that
+    feature. This is the weaker half of the gate: it reports a declared conflict,
+    it does not prove the import happens. `importscan.runtime_conflicts` is the
+    half that can prove it, by reading the shipped files.
+
+    Only unmarked requirements are counted: a requirement gated on an extra is
+    not installed here (`--no-deps`, no extras), and a requirement gated on an
+    environment marker cannot be evaluated without the `packaging` library, so
+    counting those would be a guess.
+    """
+    problems = set()
+    for dist in site_packages(venv).glob("*.dist-info"):
+        name = rules_mod.norm(dist.name.split("-")[0])
+        if rules_mod.denied(name, rule):
+            continue
+        metadata = dist / "METADATA"
+        if not metadata.exists():
+            continue
+        for line in metadata.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = REQUIRES_LINE.match(line)
+            if not m or m.group("marker"):
+                continue
+            required = rules_mod.norm(NAME_PART.split(m.group("req"))[0])
+            if rules_mod.denied(required, rule):
+                problems.add(f"{required} (required by {name})")
+    return sorted(problems)
+
+
 def drop_build_path_launchers(venv: Path, build_root: Path) -> int:
     """Console scripts that hardcode the build machine are useless at runtime."""
     removed = 0
@@ -168,7 +203,28 @@ def build(
     dropped = drop_build_path_launchers(venv, wheelhouse)
     print(f"launchers dropped: {dropped}")
 
+    # The selection is the shipped set. Read it before the tree is rewritten:
+    # a pyc-only rule removes the source files the scan needs to read.
+    selected = set(pkg_mod.select(tree, rule, archs))
+    hard = importscan.runtime_conflicts(
+        tree, rule, importscan.top_level_map(tree), selected
+    )
+    if hard:
+        raise SystemExit(
+            "denied name imported at module level by a shipped file:\n  "
+            + "\n  ".join(hard)
+        )
+
     pkg = pkg_mod.build(tree, rule, out, archs, archive=True)
+
+    declared = denied_dependencies(venv, rule)
+    if declared:
+        print(
+            "declared by a shipped package, not imported at module level by a "
+            "shipped file (optional as the rule intends):"
+        )
+        for line in declared:
+            print(f"  {line}")
 
     uncovered = libdeps.uncovered(pkg)
     if uncovered:
