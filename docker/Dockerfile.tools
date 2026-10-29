@@ -1,0 +1,38 @@
+# Gate and test image. Nothing here ever reaches a shipped image (rule 3): this
+# exists so that gates, tests, and measurements run inside a container instead
+# of on the host interpreter.
+#
+# Every version is pinned to .pre-commit-config.yaml so a local container run and
+# a CI run cannot disagree.
+ARG PY_BASE=python:3.12-slim
+ARG NODE_BASE=node:22-slim
+
+FROM ${NODE_BASE} AS mdlint
+RUN npm install -g --silent markdownlint-cli2@0.23.2
+
+FROM ${PY_BASE}
+
+# node is present only to run markdownlint-cli2.
+COPY --from=mdlint /usr/local /usr/local
+
+# binutils provides strip, which the packaging pipeline treats as an explicit
+# pipeline step; without it the strip stage is skipped and the manifest
+# describes unstripped bytes.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        shellcheck \
+        binutils \
+        git \
+        docker-cli \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    ruff==0.14.10 \
+    typos==1.49.0 \
+    pyyaml==6.0.2 \
+    pytest==8.3.3
+
+ENV PYTHONPATH=/workspace
+WORKDIR /workspace
+CMD ["bash"]

@@ -13,6 +13,11 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ALLOWED=("packaging" "docker" "tools")
 CONTEXT="${VDE_CONTEXT:-$REPO/out/context}"
 
+# The docker CLI reads the Dockerfile and the context from its own filesystem,
+# then sends a tar to the daemon. Running inside the tools container means the
+# correct path is the bind mount (/workspace), not the host path — the daemon
+# never resolves a host path here, it receives the archive.
+
 VARIANT="engine"
 PACKAGING="thin"
 TAG="vllm-slim:dev"
