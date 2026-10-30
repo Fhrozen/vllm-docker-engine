@@ -33,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import arch as arch_mod  # noqa: E402
 import cuda as cuda_mod  # noqa: E402
+import importscan  # noqa: E402
 import libdeps  # noqa: E402
 import rules as rules_mod  # noqa: E402
 
@@ -68,7 +69,9 @@ def select(
         if not path.is_file():
             continue
         rel = path.relative_to(src).as_posix()
-        if rules_mod.denied(rel, rule, owner) or rules_mod.pruned(rel, rule):
+        if rules_mod.denied(rel, rule, owner):
+            continue
+        if rules_mod.pruned(rel, rule) and not rules_mod.kept(rel, rule):
             continue
         if rules_mod.cuda_variant(rel, rule, cuda_series):
             continue
@@ -332,7 +335,12 @@ def build(
     out.mkdir(parents=True, exist_ok=True)
 
     archs = list(archs)
-    picked = select(src, rule, archs, cuda_series=cuda_series)
+    # Deny entries are distribution names, the first path segment is an import
+    # name, and the two differ (`cupy-cuda12x` installs `cupy`, `cupyx` and
+    # `cupy_backends`). Without the RECORD owner map a denied distribution still
+    # ships, which is what the source-tree variant measured.
+    owner = importscan.top_level_map(src)
+    picked = select(src, rule, archs, owner, cuda_series=cuda_series)
     if not picked:
         raise SystemExit("rule selected nothing -- check allow/deny/prune patterns")
 

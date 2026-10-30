@@ -116,6 +116,72 @@ Libraries the workload did not map, kept as candidates only:
 Runtime import closure from the entry path: 90 distributions / 4,161.8 MB —
 the set of packages a shipped file imports at module level.
 
+### cupy and ray, measured
+
+Correction to an earlier reading: the serving workload does **not** map cupy.
+Cupy appears only in the never-mapped list, as three distributions installed by
+one package (`cupy` 221.0 MB, `cupy_backends` 34.4 MB, `cupyx` 9.9 MB =
+**265.3 MB**), next to `ray` 53.7 MB.
+
+Unpacked on the real install (`out/run2/vllm.venv`, 196 lock entries):
+
+| Distribution | Files | Unpacked MB | Wheel MB |
+| --- | --- | --- | --- |
+| `ray` | 5,317 | 230.4 | 78.9 |
+| `cupy` | 2,330 | 240.3 | 136.1 (cupy side, one wheel) |
+| `cupyx` | 418 | 16.5 | |
+| `cupy_backends` | 23 | 34.4 | |
+| **cupy side** | **2,771** | **291.2** | **136.1** |
+
+Cupy cannot ship: the cutensor extension in
+`cupy_backends/cuda/libs/` (`cutensor.cpython-312-x86_64-linux-gnu.so`) needs
+`libcutensor.so.2` and `libcutensorMg.so.2`, which are in no wheel of the lock
+and in no folder of the tree. Its other `.so` files are satisfiable
+(`libcusparse`, `libcusolver`, `libnccl`), so this one file is the whole
+blocker. The deny stands, and it is enforced through the RECORD owner map,
+because `cupy-cuda12x` owns three folders.
+
+Both names are in the lock: `ray==2.59.0` and `cupy-cuda12x==14.2.0`. vllm's
+requirements files name neither, so they enter through `ray[cgraph]`, a hard
+`Requires-Dist` of the vllm wheel. A lock-based build therefore installs cupy
+even though the rule denies it — the deny is a policy choice, not a statement
+about what the lock resolves.
+
+Runtime branches on the GPU, warm cache, same model and seed:
+
+| Branch | Selection | Result |
+| --- | --- | --- |
+| cupy pruned, importer pruned | 66,796 files / 10,911.4 MB | OK, 41.6 s |
+| cupy pruned, `ray` kept whole | 66,797 files / 10,911.4 MB | OK, 41.8 s |
+| `ray` and cupy pruned | 61,480 files / 10,681.1 MB | OK, 40.7 s |
+
+The second row is the point: the cupy import is never reached, so the deny
+conflict is static. The gate is stricter than the served path.
+
+### Imports that point at a pruned file, measured
+
+The pruned-file gate found 10 findings from 9 importers (132.5 KB of importers)
+pointing at 7 targets (76.3 KB):
+
+Targets, by size:
+
+- `numba/tests/support.py` — 45.4 KB
+- `jsonschema/tests/_suite.py` — 8.4 KB
+- `numpy/_core/tests/_natype.py` — 6.3 KB
+- `torch/testing/_internal/distributed/rpc/examples/`
+  `reinforcement_learning_rpc_test.py` — 9.3 KB
+- `torch/testing/_internal/distributed/rpc/examples/`
+  `parameter_server_test.py` — 4.6 KB
+- `torch/_export/db/examples/__init__.py` — 1.6 KB
+- `numba/tests/__init__.py` — 0.8 KB
+- **total — 76.3 KB**
+
+Importing the importers in the materialised view fails on other names that are
+also missing (`pyperf`, `numba.tests`, `hypothesis`, `expecttest`), so neither
+side of these imports is reached at runtime. Decision: keep the 7 targets —
+76.3 KB is cheaper than breaking an import. After the decision the selection is
+47,921 files / 10,505.7 MB and both import gates report 0 findings.
+
 ### Triton cache, measured
 
 The runtime image has no compiler, so triton can only run kernels the build
@@ -129,6 +195,15 @@ stage compiled. Measured in the container:
   kernel artifacts themselves are arch-specific.
 - Minimum warm cache for one kernel: **10 files / 0.07 MB**. A serving run
   compiles many kernels, so the shipped cache is small but not fixed in size.
+  Measured for the target model on the GPU: **1033 files / 48.6 MB** eager,
+  **1710 files / 58.5 MB** compiled.
+- JIT files that cannot be pruned even on a full cache hit: `libtriton.so`
+  415.6 MB, `libnvJitLink.so.12` 94.1 MB, `ptxas` 31.9 MB. Prunable for this
+  model: cupti 110.8 MB, `ptxas-blackwell` 34.9 MB, `cuda_nvrtc` 222.1 MB,
+  `tilelang` 176.3 MB, `flashinfer` 53.2 MB — **597.3 MB** in total.
+- A C toolchain in the runtime image costs **111.6 MB** installed (`gcc` +
+  `libc6-dev`) and forces nvrtc and cupti to stay. Pre-warming the cache is
+  about **660 MB** cheaper and keeps the runtime image toolchain-free.
 
 The decision this produces is recorded in `Plan.md` finding 5.
 
@@ -219,9 +294,16 @@ declared series becomes 13.
   cannot be pruned. Without cubins it falls back to JIT, which needs `nvcc` at
   runtime and breaks rule R01 — so on this GPU flashinfer ships as inert code
   unless the backend is never selected.
-- **`.pyc-only` costs more than source.** Inside the selection, `.pyc` is
-  258.0 MB and `.py` is 230.3 MB: `bytecode: pyc-only` is a startup-latency
-  choice worth −27.7 MB, not a saving.
+- **`pyc-only` is the smaller build, not the larger one.** The tree already
+  carries 24,079 `.pyc` files (394.9 MB) before any build; the selection keeps
+  21,064 of them (338.2 MB). A `bytecode: source` build compiles the `.py`
+  files it keeps and ships **both** forms — 21,061 `.py` (304.7 MB) plus the
+  338.2 MB of bytecode. A `pyc-only` build removes the `.py` mirrors and ships
+  bytecode only. Measured on the same rule and arch: engine 10,102.7 MB from
+  source against 9,798.0 MB from `.pyc` (−304.7 MB), thin 10,020.8 against
+  9,755.0 (−265.8 MB). The earlier reading that `.pyc-only` costs more
+  compared the tree's pre-existing bytecode (258.0 MB) with the `.py` read set
+  (230.3 MB); that is a selection detail, not what a build delivers.
 - **Two prune patterns never fired.** `nvidia/cusparseLt/**` matches nothing
   because the real folder is `nvidia/cusparselt` (452.0 MB shipped);
   `nvidia/cupti/**` matches nothing because the real folder is
@@ -243,6 +325,14 @@ declared series becomes 13.
   `**/*.pyi` 5.6, `**/*.pyx` 5.2, `**/examples/**` 2.6, `**/test/**` 0.6,
   `**/*.cmake` 0.3. `**/benchmarks/**` (2.9 MB) was removed from the rule
   because the entry path reaches `vllm.benchmarks` through the CLI.
+- **Two of those patterns break imports.** `**/tests/**` and `**/test/**` prune
+  files that shipped modules import at module level — that is why the
+  pruned-file import gate exists. Seven targets (76.3 KB) are now exceptions in
+  the rule, because shipping them is cheaper than breaking an import.
+- **Deny entries are distribution names, not folder names.** `cupy-cuda12x` owns
+  `cupy`, `cupyx` and `cupy_backends`, so a deny is only enforced through the
+  RECORD owner map. `package.build()` was calling `select()` without it, which
+  let a denied distribution ship and made the uncovered gate fire.
 - **Names the entry path executes, so they cannot be pruned:**
   `huggingface-hub` 6.8 MB and `setuptools` 7.5 MB. Both were in the deny list
   and are now shipped.

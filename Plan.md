@@ -115,6 +115,25 @@ number. Findings so far are collected in `docs/findings.md`.
    without pulling, and a tag the registry refuses prints the failure without the
    401 sentence and exits 1 (`nvidia/cuda:12.4.1-devel-ubuntu24.04`). A real
    network 401 has not been observed since the rule was written.
+10. **A deny names a distribution, and the import gate has two halves.**
+    `cupy-cuda12x` is denied by the rule, and `package.build()` was calling
+    `select()` without the `RECORD` owner map, so the three folders it owns
+    (`cupy`, `cupyx`, `cupy_backends`) still shipped and the uncovered gate fired
+    on `cupy_backends/cuda/libs/cutensor...so` — that file needs
+    `libcutensor.so.2` and `libcutensorMg.so.2`, which are in no wheel of the
+    lock, so cupy cannot ship at all. The second half is a shipped file that
+    imports a pruned file: `ray/util/collective/collective_group/cuda_stream.py`
+    (2,975 bytes) imports cupy at module level, and `ray[cgraph]>=2.48.0` is a
+    hard requirement of the vllm wheel. vllm's requirements files name neither
+    ray nor cupy; the lock contains both (`ray==2.59.0`, `cupy-cuda12x==14.2.0`)
+    because it resolves that extra, so the thin variant installs cupy and the
+    deny gate fires. Three runtime branches were run on the
+    GPU — importer pruned, ray kept whole, both pruned — and all three served the
+    model (41.6 s, 41.8 s, 40.7 s), so the conflict is static only. Decision:
+    deny cupy, prune the three ray files that reach it, and keep the 7 targets the
+    pruned-file gate found (76.3 KB), because shipping is cheaper than breaking an
+    import. Both halves now report 0 findings on 47,921 files / 10,505.7 MB.
+    Details in `docs/findings.md`.
 
 ## Phases
 

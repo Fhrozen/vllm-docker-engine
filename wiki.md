@@ -111,7 +111,24 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
 - `rules.matches()` takes a **list** of patterns. A bare string iterates characters and makes
   every pattern match every file, which produced a false "no dead prune patterns" reading.
 - A prune can break the image when libtorch `DT_NEEDED`s the target. That is why
-  `nvidia/cusparselt` (452.0 MB) and `nvidia/cuda_cupti` (41.3 MB) cannot be pruned at all.
+  `nvidia/cusparselt` (452.0 MB) and `nvidia/cuda_cupti` (41.3 MB) cannot be
+  pruned at all.
+- A `deny` entry names a **distribution**, not a folder, so it is enforced through
+  the `RECORD` owner map: `cupy-cuda12x` owns `cupy/`, `cupyx/` and
+  `cupy_backends/`, and `norm("cupy_backends")` is `cupy-backends`. `select()`
+  must be given that map, or a denied distribution still ships and the uncovered
+  gate fires on it.
+- A deny can fire on a lock-based build even when the requirements files do not
+  name the package. vllm's `common.txt` and `cuda.txt` name neither `ray` nor
+  `cupy-cuda12x`, but the lock contains both because the vllm wheel requires
+  `ray[cgraph]`. Denying a name is a policy choice; it does not mean the lock
+  resolves without it.
+- The import gate has two halves: a shipped file must not import a denied
+  distribution, and it must not import a file the rule prunes. Both halves are
+  static, so a finding can name a file that no workload ever imports — that is
+  what happened with `ray`'s cupy importer. `keep` in the rule is the exception
+  list for the second half, used when shipping the target is cheaper than
+  breaking an import.
 - `arch_of()` requires the arch as a distinct token. Files whose arch is embedded inside the
   name (hash-named cubins) cannot be arch-filtered, so that split has to be measured by hand.
 - The evaluation view must start clean. A reused view reports a package as reachable because an
@@ -130,6 +147,18 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   **before** the compiler is looked up. `cc` alone is not enough — compiling also needs `libc6-dev`
   headers. Triton's cache key contains no GPU architecture, so the build stage must warm the cache
   on the target arch and ship it.
+- Even on a full cache hit, `ptxas` is called (the backend hash runs
+  `ptxas --version`), so it stays in the runtime image;
+  `ptxas-blackwell` does not. `libtriton.so` needs `nvjitlink` at load
+  time, so that tree stays too. `cuda_nvrtc` and cupti are only used
+  when a kernel is compiled or profiled, so a warm-cache image can drop
+  them.
+- The cache key is the digest of the compiler source files, so pruning
+  them changes the key. Pruning `.py` files under `compiler/` or
+  `backends/` does **not** change it (measured: `3.6.00355c3e3452`
+  with and without `triton/backends/amd`), and env vars do not either
+  (`get_cache_invalidating_env_vars()` returns `{}`). Measure each tree
+  in its own process, because `triton_key()` reads files from disk.
 - Forbidden suffixes in the shipped tree: `.a`, `.o`, `.cmake`, plus `pkgconfig/` and dev headers —
   except when the `.pyc`-only mode is *not* chosen, in which case `.py` is allowed by rule.
 - Files being present in the tree is not the same as the loader finding them. `uncovered()`

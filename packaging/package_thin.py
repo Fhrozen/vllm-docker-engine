@@ -210,10 +210,13 @@ def build(
     owner = importscan.top_level_map(tree)
     selected = set(pkg_mod.select(tree, rule, archs, owner, cuda_series))
     hard = importscan.runtime_conflicts(tree, rule, owner, selected)
-    if hard:
+    dangling = importscan.imports_pointing_at_dropped(tree, selected)
+    if hard or dangling:
+        # Both halves are the same defect seen from two sides: a shipped file
+        # imports something the shipped tree cannot provide.
         raise SystemExit(
-            "denied name imported at module level by a shipped file:\n  "
-            + "\n  ".join(hard)
+            "module-level imports the shipped tree cannot satisfy:\n  "
+            + "\n  ".join(hard + dangling)
         )
 
     pkg = pkg_mod.build(tree, rule, out, archs, archive=True, cuda_series=cuda_series)

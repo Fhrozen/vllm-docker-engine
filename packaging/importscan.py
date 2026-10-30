@@ -65,6 +65,49 @@ def module_level_imports(path: Path, prefix: str | None = None) -> list[str]:
     return found
 
 
+def module_file(module: str, tree: Path) -> str | None:
+    """The tree-relative file an absolute dotted import resolves to.
+
+    `ray.util.collective.collective_group.cuda_stream` is the file
+    `ray/util/collective/collective_group/cuda_stream.py`, or the package folder
+    `.../cuda_stream/__init__.py`. Relative imports are skipped: they resolve
+    inside the importing package, not through the tree root.
+    """
+    if module.startswith("."):
+        return None
+    base = tree.joinpath(*module.split("."))
+    for candidate in (base.with_suffix(".py"), base / "__init__.py"):
+        if candidate.is_file():
+            return candidate.relative_to(tree).as_posix()
+    return None
+
+
+def imports_pointing_at_dropped(
+    tree: Path,
+    selected: set[str],
+) -> list[str]:
+    """Shipped files that import a module the selection has dropped.
+
+    A denied distribution leaves no file at all, so the deny gate covers that
+    case. A pruned file inside a kept distribution does not: the importer ships
+    and the imported module does not, which is a runtime ImportError on a path
+    the gate would otherwise pass. Both are reported together so a selection is
+    judged by what it can actually import, not only by what it keeps.
+    """
+    problems = set()
+    for rel in sorted(selected):
+        if not rel.endswith(".py"):
+            continue
+        for module in module_level_modules(tree / rel):
+            target = module_file(module, tree)
+            if target is not None and target not in selected:
+                problems.add(
+                    f"{rel}: imports {module} at module level, but {target} "
+                    "is not in the selection"
+                )
+    return sorted(problems)
+
+
 def top_level_map(site_packages: Path) -> dict[str, str]:
     """top-level directory -> normalised distribution name, read from RECORD."""
     owner: dict[str, str] = {}

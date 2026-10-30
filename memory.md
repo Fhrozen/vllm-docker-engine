@@ -9,7 +9,7 @@ next action. Every number here must come from a run in this repo, not from an es
 | --- | --- | --- |
 | 0 — files & plan | done | `Plan.md`, `memory.md`, `wiki.md`, `docs/`, agents |
 | 1 — package research | complete (research + measurement) | findings folded into `Plan.md`, numbers in `docs/SIZES.md` |
-| 2 — docker build spikes | ready, not started | the three rules are implemented, tested and documented, so the next step is the first build. Needs a runnable base image: `nvidia/cuda:12.8.1-devel-ubuntu24.04` is already local, and `bash docker/run.sh pull <image>` now reports a 401 instead of retrying. Docker Hub pulls previously failed with 401; local `vllm/vllm-openai:latest` works |
+| 2 — docker build spikes | ready, not started | the three rules are implemented, tested and documented, so the next step is the first build. Needs a runnable base image: `nvidia/cuda:12.8.1-devel-ubuntu24.04` is already local, and `bash docker/run.sh pull <image>` now reports a 401 instead of retrying. Docker Hub pulls previously failed with 401; local `vllm/vllm-openai:latest` works. Both import gates now report 0 findings on the real install after the cupy/ray decision (finding 10 in `Plan.md`) |
 | 3 — vLLM slim image | tooling written, gates + tests green in docker | `packaging/` + `docker/` are in place |
 | 3b — harness | tooling written, no measurements yet | `tools/measure.sh` |
 | 4 — vllm-omni overlay | blocked on the Phase 3 gate | gate: <= 4 GB AND >= 60% smaller than baseline |
@@ -63,6 +63,17 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | 401 reporting, measured in the container | a fabricated 401 detail prints the source, the sentence asking the user to check availability or download directly, and the detail itself; `check_image` on an image that is already local returns without pulling; `nvidia/cuda:12.4.1-devel-ubuntu24.04` prints the registry failure without the 401 sentence and exits 1. A real network 401 has not been observed since the rule was written |
 | `test` (127 tests) | exit 0, all passed. Six failures were fixed first: the driver-error wording needed the "would not start on this machine" clause, `check_image_size` needed the 6 GB gate threshold with 4 GB as the stretch goal, and the report/shell-copy parity test reads `docker/pull.sh` from the repo root |
 | `gate` on the 19 files changed for the three new rules | clean: ruff check and format (6 python files unchanged), `check_files`, shellcheck, `bash -n`, typos, and markdownlint 0 issues in the 5 gated files. `wiki.md`, `memory.md`, `Plan.md` and the `.github/` files are outside the markdownlint pattern and were skipped. Re-gated after wrapping the added prose at 80 columns: clean, and `test` re-run at 127 passed |
+| `test` (131 tests) | exit 0, all passed. Four new tests cover the cupy/ray decision: the pruned-file import gate, the `keep` exception, a deny enforced through the `RECORD` owner map, and `select()` called with that map |
+| `gate` on the 7 files changed for the cupy/ray decision (`packaging/importscan.py`, `packaging/rules.py`, `packaging/package.py`, `packaging/package_thin.py`, `packaging/rules/vllm.json`, `tools/evaluate_deny.py`, `tests/test_packaging.py`) | clean. Ruff reformatted 2 of them; re-run needed before the docs gate rows below |
+| import gate on the real install, before the decision | 10 findings from 9 importers (132.5 KB) pointing at 7 targets (76.3 KB); deny gate 1 finding (`ray/util/collective/collective_group/cuda_stream.py`, 2,975 bytes, imports the denied `cupy-cuda12x`) |
+| import gate on the real install, after the `keep` decision | 0 findings on both halves, selection 47,921 files / 10,505.7 MB (47,917 before, +7 keep −3 ray prune entries) |
+| cupy / ray runtime branches on the GPU (warm cache, same model and seed) | cupy pruned + importer pruned → OK 41.6 s; cupy pruned + ray kept whole → OK 41.8 s; ray and cupy pruned → OK 40.7 s. The cupy import is never reached, so the deny conflict is static |
+| importing the 9 pruned-file importers in the materialised view | all 9 fail on other missing names (`pyperf` ×2, `numba.tests` ×3, `hypothesis`, `numpy._core.tests`, `torch._export.db.examples`, `expecttest`) — neither side of the import is reached at runtime |
+| cupy against the lock, checked after the decision | `out/locks/vllm-linux-x86_64.txt` contains `ray==2.59.0` and `cupy-cuda12x==14.2.0`. vllm's `common.txt` and `cuda.txt` name neither, so both come from the `ray[cgraph]` extra in the wheel metadata: the thin variant installs cupy, which is why the deny gate fires on the real install. Denying cupy is a policy choice, not a claim that the lock resolves without it |
+| `compare_packaging.py` re-run after the owner-map fix (`out/compare-cupy2.txt`) | all four combinations clean, no build failure: engine/source 47,928 files / 10,102.7 MB, thin/source 45,829 / 10,020.8 MB (archive 5,155.1 MB), engine/pyc-only 26,867 / 9,798.0 MB, thin/pyc-only 25,803 / 9,755.0 MB (archive 5,099.9 MB). Manifest True, gates clean, usability ok on all four |
+| the `bytecode` modes, measured on the builds | the tree carries 24,079 `.pyc` (394.9 MB) before any build; the selection keeps 21,064 (338.2 MB). `source` compiles the `.py` it keeps and ships both forms (21,061 `.py` = 304.7 MB + 338.2 MB bytecode); `pyc-only` removes the `.py` mirrors and ships bytecode only. So `pyc-only` is the smaller build: engine 10,102.7 → 9,798.0 MB, thin 10,020.8 → 9,755.0 MB. The earlier "pyc-only costs more" reading was a selection comparison (258.0 vs 230.3 MB), not a build measurement — corrected in `docs/SIZES.md` |
+| `gate` on `docs/SIZES.md` after the build numbers were added | clean, 0 issues |
+| `gate` on `docs/PACKAGING.md` `docs/SIZES.md` after the bytecode correction | first run FAILED on one 81-character prose line in `docs/PACKAGING.md` (MD013). After rewrapping: clean, 0 issues in 2 files |
 
 ### Build runs
 
@@ -262,6 +273,37 @@ Triton and the no-compiler rule (R01), measured:
 - Minimum warm cache for this test: 10 files, 0.07 MB (two C extensions plus one
   kernel). A real serving run compiles many kernels.
 
+JIT runs on the GPU, measured (Phase 2, `tools/evaluate_jit.py`):
+
+- Cache key for the target tree is `3.6.00355c3e3452`, and it is **the same with and
+  without `triton/backends/amd`** — pruning compiler-side `.py` files does not change
+  the key, so a cache built on the full tree is valid on the pruned tree.
+- `get_cache_invalidating_env_vars()` returns `{}` with and without
+  `TRITON_BACKENDS_IN_TREE=1`: env vars do not change the key.
+- Warm cache, no compiler on PATH, serving run: **OK, 42.4 s, hits=114 misses=0
+  puts=0**. Only `libtriton.so` (415.6 MB) and `libnvJitLink.so.12` (94.1 MB) load.
+- Cold cache, no compiler: **FAILED** (`Failed to find C compiler`). With `gcc` alone:
+  **FAILED on `stdlib.h`**. With `gcc + libc6-dev`: **OK, 97.0 s**, cache = 1033 files
+  / 48.6 MB. Compiled path (`--compiled`), cold: **OK, 119.4 s**, cache = 1710 files /
+  58.5 MB.
+- `ptxas` is required **even on a full cache hit** (the backend hash runs
+  `ptxas --version`): removing `bin/ptxas` failed with `Cannot find ptxas`.
+  `ptxas-blackwell` (34.9 MB) is not required.
+- `nvidia/cuda_nvrtc` (222.1 MB) is only used when a kernel is compiled: runs serve
+  with it removed. `nvidia/nvjitlink` (94.1 MB) cannot be removed — `libtriton.so`
+  needs it at load time. cupti (110.8 MB) is not used for serving.
+- `tilelang` (176.3 MB) and `flashinfer` (53.2 MB) are not used by this model in eager
+  mode; removing them entirely still serves. They are optional kernel backends, so the
+  decision is prune-by-default / keep-as-flavor, not prune-always.
+- Compiler cost measured in the container: `gcc + libc6-dev` = **111.6 MB installed**.
+- Decision from the two branches: **ship a pre-warmed cache and prune the compile-side
+  tree**. Warm cache (48.6 MB eager, 58.5 MB compiled) + 597.3 MB pruned beats a
+  compiler (111.6 MB, plus nvrtc and cupti must stay) by about **660 MB**, and keeps
+  R01 for the runtime image. `ptxas` stays: it is an assembler the cache key needs,
+  not a C compiler.
+- The compiled path also runs on the pruned view against the cache it produced:
+  **OK, 53.2 s, hits=110**, no compiler, no nvrtc.
+
 Two false readings this phase, both corrected by re-running:
 
 - `rules_mod.matches(rel, pattern)` called with a bare string iterates
@@ -410,19 +452,28 @@ a tenth.
    selection is now 44,441 files / 9,986.6 MB, so the build has to be re-run to
    fill the size table in `docs/SIZES.md`.
 2. Baseline row: `bash docker/run.sh measure vllm/vllm-openai:latest`.
-3. Decide the JIT source (104.8 MB): R01 forbids a compiler in the runtime image,
-   so the `.cpp`/`.cc` trees in the selection cannot be used there. Pruning them
-   is only safe if nothing on the entry path compiles at import time — flashinfer
-   is the case to check on the GPU, because on sm_86 it has no prebuilt kernels.
+3. JIT source: **decided by measurement** (see the GPU runs above). The build stage
+   warms the cache for the target model and arch, the runtime image ships that cache
+   and drops the compile-side tree except `ptxas` and `nvjitlink`. The `.cpp`/`.cc`
+   trees in the selection (104.8 MB) are build-stage material only, which is what R01
+   requires. flashinfer is still worth a GPU check for models that select it, because
+   on sm_86 it has no prebuilt kernels.
 4. Uncovered gate: **0 findings** after the decisions (was 14, then 13, then 3). The
    `libgomp.so.1` glob was widened to `libgomp.so.*` because apt installs
    `libgomp.so.1.0.0` plus a symlink, and foreign-arch ELF files are now refused by
    `select()` (the build run failed at `strip` on cutlass-dsl aarch64 stubs).
-5. Decide R01 vs triton (mechanism measured, decision recorded as `Plan.md` finding 5):
-   either the build stage warms and ships the triton cache for the target model and
-   arch, or R01 is relaxed for the runtime image. The choice changes what the build
-   stage must run and what the package must carry, so it is decided before the build
-   is re-run.
+   **Correction:** the "0 findings" reading was taken on a view built from a tree
+   without `ray`. On the real install the gate fails on
+   `cupy_backends/cuda/libs/cutensor.cpython-312-x86_64-linux-gnu.so`
+   (`libcutensor.so.2`, `libcutensorMg.so.2` — in no wheel of the lock and in no
+   folder of the tree) once the `RECORD` owner map is passed to `select()`. Cupy
+   cannot ship, so the deny stands. The pruned-file half of the import gate found
+   10 findings (9 importers, 132.5 KB, 7 targets, 76.3 KB); decision: keep the 7
+   targets, because shipping 76.3 KB is cheaper than breaking an import. After the
+   decision both halves report 0 findings on 47,921 files / 10,505.7 MB.
+5. R01 vs triton: **decided** — pre-warmed cache, no compiler in the runtime image.
+   The build stage must run the serving workload once to produce the cache, and the
+   package must carry it. What the build stage runs is now fixed by that decision.
 6. Spike A (control) vs Spike B (pruned): `bash docker/run.sh spike`, then
    `bash docker/run.sh script tools/compare_packaging.py`.
 7. Decide the loader path for the runtime image (mechanism measured above): import
@@ -441,3 +492,20 @@ a tenth.
    already local on this host, so `check_image` returns without pulling. If a pull
    is needed and the registry answers 401, the user is asked to check availability
    or download the image directly; the build does not retry.
+10. **Open: `bytecode: source` ships both forms.** It compiles the `.py` files
+    it keeps and never drops the tree's pre-existing `__pycache__`, so a source
+    build pays for source *and* bytecode (304.7 MB in the engine variant).
+    Decide whether `source` should mean "source only" — that is, drop the
+    `.pyc` mirrors — or keep the current behaviour and say so in
+    `docs/PACKAGING.md`. The earlier 10-byte / 27.5 MB "gap" was a misreading of
+    the compare output, not a defect.
+11. **Open: cupy ships as ELF only.** The uncovered gate is not satisfied by the
+    whole cupy distribution, only by its `.so` files (`cutensor` needs an
+    external package either way). If cupy ever ships, decide whether the shape is
+    "distribution minus its non-ELF material" or "ELF files only" — the current
+    rule cannot express either, because a deny is all-or-nothing.
+12. `importscan.imports_pointing_at_dropped()` resolves a dotted import against
+    the tree, so it must be given the same relative paths as the selection.
+    `package_thin.build()` passes `str(rel)`, `compare_packaging.py` passes a
+    `pathlib.Path`; both work, and the gate's docstring says paths must be
+    relative to the tree root.

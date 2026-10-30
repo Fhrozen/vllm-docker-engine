@@ -97,6 +97,18 @@ same source into two output folders are not the same package.
 Verified: two builds of the same tree into two different `--out` folders produce
 byte-identical archives.
 
+### What each bytecode mode delivers
+
+`source` compiles the `.py` files it keeps and does not drop the tree's existing
+`__pycache__`, so a source build ships **both** forms. `pyc-only` removes the
+`.py` mirrors of files that were compiled, so it ships bytecode only. Measured on
+the same rule and arch, `pyc-only` is the smaller package: 9,798.0 MB against
+10,102.7 MB for the engine variant, 9,755.0 against 10,020.8 for the thin one.
+
+A tree that already carries bytecode is therefore not a neutral input: the
+selection keeps the `.pyc` files it finds, and the mode decides whether the source
+form is delivered alongside them.
+
 ## Target tags
 
 Two measured facts about `pip download` with an explicit target:
@@ -144,6 +156,12 @@ package name into an import name: `flashinfer-python` owns `flashinfer/`,
 `opencv-python-headless` owns `cv2/`. A distribution is not a conflict with
 itself, and a file's owner comes from the same map.
 
+A deny names a **distribution**, not a folder, so `select()` must be given the
+same map. Without it a file's owner is guessed from its first path segment,
+`cupy_backends/` does not match `cupy-cuda12x`, and the denied distribution
+ships anyway — measured on the engine variant, where the uncovered gate then
+fired on a cupy `.so`.
+
 The hard half scans the selection in source form, before the package is built. A
 `bytecode: pyc-only` rule removes the `.py` files the scan reads, so scanning the
 built tree finds nothing — measured on the first real build, where this gate
@@ -170,6 +188,25 @@ must ship — the rule has to change, not the build.
 `check_archive` verifies bytes **inside** the archive before anything is
 unpacked. That is the point of the gate: a member is trusted only after its
 bytes match the manifest.
+
+### Imports pointing at pruned files
+
+A deny stops a distribution from shipping. A prune stops individual files, and a
+shipped file can import one of them. `importscan.imports_pointing_at_dropped()`
+resolves each module-level import against the tree and reports an importer whose
+target is in the tree but not in the selection. Paths must be relative to the
+tree root, the same form `select()` returns.
+
+This gate fails the build, and a rule answers it with `keep`: a pattern that
+re-selects a file the prune would drop. The decision is which side is cheaper to
+ship. On the real install the gate found 7 targets totalling 76.3 KB behind 9
+importers, and all 7 were kept — shipping 76.3 KB is cheaper than breaking an
+import.
+
+Both import gates are static, so a finding can name a file that no workload ever
+imports. That is exactly what happened with `ray`: the importer is reachable, but
+the serving path never reaches it. A finding is a call to evaluate both sides, not
+proof that the image is broken.
 
 ## The evaluation
 

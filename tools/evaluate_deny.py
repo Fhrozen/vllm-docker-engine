@@ -20,6 +20,13 @@ Nothing here runs on the host. Run it inside the container, e.g.
 
   bash docker/run.sh script tools/evaluate_deny.py --wheelhouse out/wheelhouse \
       --venv out/eval-venv --rule vllm
+
+The gate half can be run alone, and a branch can be tested without editing the
+rule, which is how the cupy/ray decision was evaluated on both sides:
+
+  bash docker/run.sh script tools/evaluate_deny.py --wheelhouse out/wheelhouse \
+      --venv out/eval-venv --rule vllm --gate --extra-prune \
+      'ray/util/collective/collective_group/cuda_stream.py'
 """
 
 from __future__ import annotations
@@ -100,6 +107,39 @@ def tree_sizes(tree: Path, top_levels: list[str]) -> tuple[int, int]:
 def sum_sizes(tree: Path, selected: set[str]) -> int:
     """Bytes of the selection only, which is what the image actually carries."""
     return sum((tree / rel).stat().st_size for rel in selected)
+
+
+def gate_report(
+    tree: Path,
+    rule: dict,
+    owner: dict[str, str],
+    selected: set[str],
+) -> tuple[list[str], list[str]]:
+    """The two halves of the deny gate, answered for one selection.
+
+    First half: a shipped file imports a denied distribution at module scope.
+    Second half: a shipped file imports a module the selection drops, either as
+    a whole top-level folder or as a single file inside a kept distribution.
+    Both are reported, because a selection that passes only the first half can
+    still be broken at runtime.
+    """
+    kept = {rel.split("/")[0] for rel in selected}
+    dangling = []
+    for rel in sorted(selected):
+        if not rel.endswith(".py"):
+            continue
+        for module in importscan.module_level_modules(tree / rel):
+            top = module.split(".")[0]
+            if (tree / top).is_dir() and top not in kept:
+                dangling.append(
+                    f"{rel}: imports {module}, but the selection keeps no file of {top}"
+                )
+    return (
+        importscan.runtime_conflicts(tree, rule, owner, selected),
+        sorted(
+            set(dangling) | set(importscan.imports_pointing_at_dropped(tree, selected))
+        ),
+    )
 
 
 def parse_findings(findings: list[str]) -> list[tuple[str, str, str]]:
@@ -199,6 +239,21 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--entry", default=ENTRY_DEFAULT)
     parser.add_argument("--arch", default="auto")
     parser.add_argument("--view", default=str(REPO / "out" / "eval-view"))
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="answer the deny gate for the selection instead of running the import loop",
+    )
+    parser.add_argument(
+        "--extra-prune",
+        default="",
+        help="comma-separated prune patterns added to the rule for this run only",
+    )
+    parser.add_argument(
+        "--extra-deny",
+        default="",
+        help="comma-separated distribution names added to the deny list for this run only",
+    )
     args = parser.parse_args(argv)
 
     wheelhouse = Path(args.wheelhouse).resolve()
@@ -210,10 +265,33 @@ def main(argv: list[str]) -> int:
         raise SystemExit(f"site-packages not found: {tree}")
 
     rule = rules_mod.load(args.rule)
+    extra_prune = [p.strip() for p in args.extra_prune.split(",") if p.strip()]
+    extra_deny = [p.strip() for p in args.extra_deny.split(",") if p.strip()]
+    if extra_prune:
+        rule["prune"] = list(rule.get("prune") or []) + extra_prune
+    if extra_deny:
+        rule["deny"] = list(rule.get("deny") or []) + extra_deny
     denied = {rules_mod.norm(name) for name in rule["deny"]}
     archs = arch_mod.resolve(args.arch)
     owner = importscan.top_level_map(tree)
     selected = set(pkg_mod.select(tree, rule, archs, owner))
+
+    if args.gate:
+        print(
+            f"gate mode: {len(selected)} files, {sum_sizes(tree, selected) / 1e6:.1f} MB"
+        )
+        if extra_prune:
+            print(f"extra prune: {', '.join(extra_prune)}")
+        if extra_deny:
+            print(f"extra deny: {', '.join(extra_deny)}")
+        conflicts, dangling = gate_report(tree, rule, owner, selected)
+        print(f"deny gate: {len(conflicts)} finding(s)")
+        for line in conflicts:
+            print(f"  {line}")
+        print(f"imports pointing at a pruned folder: {len(dangling)} finding(s)")
+        for line in dangling:
+            print(f"  {line}")
+        return 1 if conflicts or dangling else 0
 
     view = Path(args.view).resolve()
     if not view_is_clean(view):

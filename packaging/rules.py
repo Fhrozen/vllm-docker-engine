@@ -11,6 +11,9 @@ A rule file is JSON. Keys:
   deny          - top-level package names or globs that are never shipped
   prune         - globs removed from the shipped tree (tests, static libs,
                   headers, pkgconfig)
+  keep          - exceptions to prune: files a shipped file imports at module
+                  scope, kept when they are small enough that shipping them is
+                  cheaper than breaking the import
   bytecode      — "source" or "pyc-only"
   strip         — run `strip --strip-debug` on ELF files as an explicit pipeline step
   arch_filter   — "auto" (detected by command) or a list of CUDA architectures
@@ -110,6 +113,18 @@ def denied(rel: str, rule: dict, owner: dict[str, str] | None = None) -> bool:
 
 def pruned(rel: str, rule: dict) -> bool:
     return matches(rel, rule.get("prune", []))
+
+
+def kept(rel: str, rule: dict) -> bool:
+    """Whether a file is an exception to the prune list.
+
+    `**/tests/**` is right for a runtime image, but a shipped file that imports a
+    pruned module at module scope breaks the moment it is imported -- measured on
+    nine such files. When what the import needs is a few kilobytes, the size rule
+    says to ship it, so the rule names those files as exceptions and the gate can
+    block on both halves without a size cost.
+    """
+    return matches(rel, rule.get("keep", []))
 
 
 def cuda_variant(rel: str, rule: dict, series: int | None) -> bool:

@@ -84,7 +84,19 @@
     "nvidia/nvshmem/lib/nvshmem_transport_ucx.so*",
     "nvidia/nvshmem/lib/nvshmem_transport_ibgda.so*",
     "nvidia/nvshmem/lib/nvshmem_transport_ibdevx.so*",
-    "nvidia/cufile/lib/libcufile_rdma.so*"
+    "nvidia/cufile/lib/libcufile_rdma.so*",
+    "ray/util/collective/collective_group/cuda_stream.py",
+    "ray/util/collective/collective_group/nccl_collective_group.py",
+    "ray/experimental/channel/nccl_group.py"
+  ],
+  "keep": [
+    "jsonschema/tests/_suite.py",
+    "numba/tests/__init__.py",
+    "numba/tests/support.py",
+    "numpy/_core/tests/_natype.py",
+    "torch/_export/db/examples/__init__.py",
+    "torch/testing/_internal/distributed/rpc/examples/parameter_server_test.py",
+    "torch/testing/_internal/distributed/rpc/examples/reinforcement_learning_rpc_test.py"
   ],
   "bytecode": "pyc-only",
   "strip": true,

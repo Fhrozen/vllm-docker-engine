@@ -659,6 +659,68 @@ def test_scan_uses_the_selection_when_bytecode_removes_the_source(tmp_path):
     ]
 
 
+def test_denied_name_is_matched_through_the_record_owner_not_the_folder_name(tmp_path):
+    """cupy_backends is a folder, cupy-cuda12x is the name the rule denies."""
+    sp = tmp_path / "site-packages"
+    (sp / "cupy_cuda12x-13.6.0.dist-info").mkdir(parents=True)
+    (sp / "cupy_cuda12x-13.6.0.dist-info" / "RECORD").write_text(
+        "cupy_backends/cuda/libs/cutensor.py,,\n"
+    )
+    src = tree(sp, {"cupy_backends/cuda/libs/cutensor.py": "x = 1\n"})
+    r = rule(deny=["cupy-cuda12x"])
+    assert package.select(src, r, ["sm_90"], owner=importscan.top_level_map(sp)) == []
+    # without the owner map the folder alone is not the denied distribution, so
+    # the package would ship it and the uncovered gate would fire on its .so
+    assert package.select(src, r, ["sm_90"]) == ["cupy_backends/cuda/libs/cutensor.py"]
+
+
+def test_gate_reports_a_shipped_file_importing_a_pruned_file(tmp_path):
+    src = tree(
+        tmp_path,
+        {
+            "keepme/api.py": "from keepme.tests.helper import x\n",
+            "keepme/tests/helper.py": "x = 1\n",
+        },
+    )
+    r = rule(prune=["**/tests/**"])
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert "keepme/tests/helper.py" not in selected
+    assert importscan.imports_pointing_at_dropped(src, selected) == [
+        "keepme/api.py: imports keepme.tests.helper at module level, "
+        "but keepme/tests/helper.py is not in the selection"
+    ]
+
+
+def test_a_small_keep_exception_resolves_the_pruned_file_import(tmp_path):
+    src = tree(
+        tmp_path,
+        {
+            "keepme/api.py": "from keepme.tests.helper import x\n",
+            "keepme/tests/helper.py": "x = 1\n",
+        },
+    )
+    r = rule(prune=["**/tests/**"], keep=["keepme/tests/helper.py"])
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert "keepme/tests/helper.py" in selected
+    assert importscan.imports_pointing_at_dropped(src, selected) == []
+    # a keep entry only matters for a file the rule prunes
+    assert rules.kept("keepme/tests/helper.py", r)
+    assert not rules.kept("keepme/api.py", r)
+
+
+def test_pruned_file_import_gate_ignores_relative_and_guarded_imports(tmp_path):
+    src = tree(
+        tmp_path,
+        {
+            "keepme/api.py": "from . import helper\n\n\ndef f():\n    import os\n",
+            "keepme/helper.py": "x = 1\n",
+        },
+    )
+    r = rule(prune=["**/helper.py"])
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert importscan.imports_pointing_at_dropped(src, selected) == []
+
+
 def test_evaluate_parse_findings_splits_a_gate_line():
     line = (
         "shipped/x.py: imports flashinfer at module level, "

@@ -144,6 +144,153 @@ Also open: the four stub `.so` files in that package are not ELF, which makes
 `strip` print "Unable to recognise the format". `strip` now skips non-ELF and
 foreign-arch files, so this is no longer a build failure.
 
+## JIT: what the image actually needs, measured
+
+JIT is not one thing in this stack, so it was measured as three: the
+engine that compiles, the per-kernel cache, and the packages that carry
+their own compiler. The tool is `tools/evaluate_jit.py`, and every run
+below happened inside a container with the GPU attached, on the target
+model.
+
+The cache key is the digest of the compiler source files, so pruning
+them changes the key. Each tree was therefore measured in its own
+process, against the cache the full tree produced.
+
+| Run | Tree | Cache | Compiler | Result |
+| --- | --- | --- | --- | --- |
+| G | full | cold | none | FAILED: no C compiler |
+| M | full | cold | gcc + libc6-dev | OK 97.0 s, 1033 puts |
+| N | full | cold | gcc + libc6-dev, compiled | OK 119.4 s, 1710 puts |
+| J | full - cupti, ptxas-blk, 3rdparty, data | warm | none | 42.4 s, hits=114 |
+| K | J - `nvidia/cuda_nvrtc` | warm | none | 42.3 s, hits=114 |
+| L | K - whole `tilelang`, `flashinfer` | warm | none | 42.0 s, hits=114 |
+| K | K | warm from run N | none | 53.2 s, hits=110 |
+| H | full - cupti, `bin/ptxas` | warm | none | FAILED: no ptxas |
+| I | full - cupti, nvrtc, nvjitlink | warm | none | FAILED: libtriton load |
+
+Runs that pass load 509.7 MB of JIT files; runs that had to compile load
+620.5 MB. The difference is `cuda_nvrtc`, which only appears when a
+kernel is built.
+
+What the runs say:
+
+- **The engine itself cannot be pruned.** `libtriton.so` (415.6 MB) and
+  `libnvJitLink.so.12` (94.1 MB) load even when every kernel is a cache hit.
+- **`ptxas` is required even on a full cache hit.** The backend hash calls
+  `ptxas --version`, so run H fails although nothing needed compiling. `ptxas`
+  (31.9 MB) stays; `ptxas-blackwell` (34.9 MB) goes.
+- **`cuda_nvrtc` (222.1 MB) is only used when a kernel is compiled.**
+  Runs J, K and L serve with it removed, so a pre-warmed image does not
+  need it.
+- **cupti (110.8 MB) is not used for serving.** It is profiling.
+- **A cold cache needs a C compiler *and* C standard-library headers.** Run M first
+  failed on `stdlib.h` from `triton/backends/nvidia/include/cuda.h`, so installing
+  `gcc` alone is not enough — `libc6-dev` is also required.
+- **The cache key does not change when compiler/backends `.py` files
+  are pruned**: `3.6.00355c3e3452` with and without
+  `triton/backends/amd`. A cache produced on the full tree is valid on
+  the pruned tree.
+- **Environment variables do not change the key**:
+  `get_cache_invalidating_env_vars()` returns `{}`, with and without
+  `TRITON_BACKENDS_IN_TREE=1`.
+
+### The tradeoff, in numbers
+
+| Option | What ships | What it costs |
+| --- | --- | --- |
+| Cache pre-warmed, JIT pruned | 48.6 eager / 58.5 compiled MB | 597.3 MB cut |
+| Compiler in the image | `gcc` + `libc6-dev` = 111.6 MB | nvrtc + cupti stay |
+
+Pre-warming wins by roughly **660 MB**, and it keeps the no-toolchain
+rule for the runtime image: the rule forbids a C toolchain and headers,
+which a warm cache removes, while `ptxas` is an assembler that the cache
+key needs, not a C compiler.
+
+Caveat to record: run L drops `tilelang` (176.3 MB) and `flashinfer`
+(53.2 MB) entirely. Nothing breaks for this model in eager mode, but
+both are optional kernel backends, so a different model or a compiled
+path that selects them would fail. The decision is therefore *prune by
+default, keep as an opt-in flavor*, not prune always.
+
+## cupy and ray: a deny read through the record owner
+
+`cupy-cuda12x` is denied by the rule, and the gate fired on it. Two facts made
+that fire possible, and both are now in the code:
+
+- A `deny` entry names a **distribution**, not a folder. `cupy-cuda12x` installs
+  `cupy/`, `cupyx/` and `cupy_backends/`, so `norm("cupy_backends")` is
+  `cupy-backends`, which is not the denied name. The `RECORD` owner map is what
+  makes the deny apply. Measured before the fix, the engine variant selected the
+  cupy folders and the uncovered gate failed on
+  `cupy_backends/cuda/libs/cutensor.cpython-312-x86_64-linux-gnu.so:
+  libcutensor.so.2 / libcutensorMg.so.2`. Neither library is in the tree or in
+  the wheelhouse, so cupy cannot ship without adding a package: the gate cannot
+  be satisfied for it.
+- The importer came from `ray`, which the rule does not name. vllm's own
+  requirements files (`common.txt`, `cuda.txt`) name neither ray nor cupy; both
+  enter through `ray[cgraph]>=2.48.0`, a hard `Requires-Dist` of the vllm wheel.
+  Cupy is only an extra of ray (`extra == "all-cpp"`), so the rule intends it to
+  be optional — but the lock as generated resolves that extra and contains
+  `ray==2.59.0` and `cupy-cuda12x==14.2.0`, so the lock-based thin variant does
+  install cupy, and that is why the deny gate fires on the real install.
+  Exactly one file outside cupy imports it at module scope:
+  `ray/util/collective/collective_group/cuda_stream.py`, 2,975 bytes, unguarded.
+  No vllm file imports `ray.util.collective`.
+
+Both branches were run on the GPU, same model, seed, prompt and warm cache:
+
+| Branch | Tree | Result |
+| --- | --- | --- |
+| cupy pruned, ray's importer pruned | 66,796 files / 10,911.4 MB | OK 41.6 s |
+| cupy pruned, ray kept whole | 66,797 files / 10,911.4 MB | OK 41.8 s |
+| ray and cupy both pruned | 61,480 files / 10,681.1 MB | OK 40.7 s |
+
+The second row is the point: the cupy import is never reached by the serving
+path, so the conflict is static only. The gate is stricter than the served path
+— it fails on a file that ships but is never imported. The rule therefore denies
+cupy and prunes the three ray files that reach it (`cuda_stream.py`,
+`nccl_collective_group.py`, `ray/experimental/channel/nccl_group.py`), which is
+the cheaper side: 291.2 MB unpacked (136.1 MB wheel) against a few kilobytes of
+ray code.
+
+Correction to record: the serving workload does **not** map cupy. cupy appears in
+the never-mapped list — `cupy` 221.0 MB, `cupy_backends` 34.4 MB, `cupyx` 9.9 MB
+(265.3 MB), `ray` 53.7 MB.
+
+### Imports that point at a pruned file
+
+The deny gate looked at top-level folders only, so a shipped file that imports a
+pruned file *inside a kept distribution* passed the gate. Measured on the real
+tree: 9 importers (132.5 KB) pointing at 7 targets (76.3 KB).
+
+Targets, and the shipped file that imports each:
+
+- `numba/tests/support.py` — 45.4 KB — `numba/cuda/testing.py`,
+  `numba/misc/help/inspector.py`
+- `jsonschema/tests/_suite.py` — 8.4 KB — `jsonschema/benchmarks/issue232.py`,
+  `jsonschema/benchmarks/json_schema_test_suite.py`
+- `numpy/_core/tests/_natype.py` — 6.3 KB — `numpy/conftest.py`,
+  `numpy/testing/_private/utils.py`
+- `torch/testing/_internal/distributed/rpc/examples/`
+  `reinforcement_learning_rpc_test.py` — 9.3 KB —
+  `torch/testing/_internal/distributed/rpc_utils.py`
+- `torch/testing/_internal/distributed/rpc/examples/`
+  `parameter_server_test.py` — 4.6 KB — the same file
+- `torch/_export/db/examples/__init__.py` — 1.6 KB —
+  `torch/_export/db/gen_example.py`
+- `numba/tests/__init__.py` — 0.8 KB — `numba/misc/POST.py`
+
+Decision: **keep the 7 targets**. The rule's size condition says to ship what
+costs a few kilobytes rather than break an import, so `prune` now has a `keep`
+exception list, and `select()` applies `prune` only when `keep` does not match.
+Gate re-run on the real tree after the decision: 47,921 files / 10,505.7 MB,
+0 findings on both halves (it reported 10 before the `keep` entries).
+
+Caveat: neither side is reached at runtime. Importing the 9 importers in the
+materialised view fails on `pyperf`, `hypothesis` and `expecttest`, so those
+importers are themselves dev files that the entry path never executes. The gate
+is a static check, and the decision is what the static check should allow.
+
 ## When a download answers 401
 
 The wording lives in `packaging/report.py`, and `docker/pull.sh` is its shell copy
@@ -179,17 +326,18 @@ reporting path is proven by the fabricated case and the local-image case only.
 
 ## Open decisions
 
-Each of these is undecided by design and will be settled by running both sides.
+Each of these is undecided by design and will be settled by running
+both sides. The JIT decision is already settled by measurement, so it is
+recorded in the section above rather than here.
 
 | Decision | What decides it |
 | --- | --- |
-| Triton cache vs relaxing R01 | warmed cache (0.07 MB) or a compiler |
 | Loader path | import order, `ld.so.conf.d` + `ldconfig`, or RUNPATH rewrite |
-| CUDA version the image declares | driver ceiling (13.0) vs wheelhouse (cu12) |
+| CUDA version the image declares | read by command: ceiling vs wheelhouse |
 | `.pyc`-only or source ship | startup latency vs +27.7 MB |
 | Packaging variant | `tools/compare_packaging.py` after both are measured |
 | cutlass cu12 vs cu13 prune | which copy the loader resolves, both measured |
-| CUDA version the image declares | read by command, ceiling vs wheelhouse |
+| tilelang / flashinfer | pruned by default, kept as an opt-in flavor |
 
 The cutlass decision is settled in mechanism and open in value: the choice is
 which copy the environment resolves, and both branches have been measured above.
