@@ -216,6 +216,25 @@ def test_the_surviving_copy_is_a_separate_value_from_the_declared_series(monkeyp
     monkeypatch.delenv("VDE_CUDA_SERIES")
 
 
+def test_resolve_keep_falls_back_to_the_tree_when_not_set(monkeypatch, tmp_path):
+    # Order is explicit value, then the variables file, then the tree. The tree is
+    # the only source that can say which copy this environment resolves.
+    monkeypatch.delenv("VDE_CUDA_KEEP", raising=False)
+    tree(tmp_path, {"nvidia_cutlass_dsl/cu12/lib/x.so": "x"})
+    (tmp_path / "nvidia_cutlass_dsl" / "cu13").mkdir()
+    assert cuda.resolve_keep("13.1") == 13
+    assert cuda.resolve_keep(None, tmp_path) == 13
+    monkeypatch.setenv("VDE_CUDA_KEEP", "12")
+    assert cuda.resolve_keep(None, tmp_path) == 12
+    monkeypatch.delenv("VDE_CUDA_KEEP")
+    assert cuda.resolve_keep("auto", tmp_path) == 13
+    with pytest.raises(SystemExit):
+        cuda.resolve_keep("not-a-series")
+    # A tree with no per-series folder decides nothing, so the caller can fall
+    # back to the declared series instead of pruning on a guess.
+    assert cuda.resolve_keep(None, tmp_path / "missing") is None
+
+
 def test_the_duplicate_cutlass_folder_measured_on_this_machine_prunes_the_dead_copy():
     # Both copies are present in the tree, each 41.6 MB, and only one is resolved.
     rule = rules.load("vllm")

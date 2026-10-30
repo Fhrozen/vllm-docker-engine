@@ -63,6 +63,11 @@ ensure_tools() {
     fi
 }
 
+# VDE_HOST_REPO is the path as the daemon sees it. A mount source written as
+# /workspace/... inside a container is resolved on the host, so a script that
+# mounts a workspace subdirectory must use the host path, not the container path.
+HOSTENV=(-e VDE_HOST_REPO="$REPO")
+
 run() {
     docker run --rm \
         -v "$REPO:$WORKDIR" \
@@ -70,6 +75,7 @@ run() {
         -e PYTHONPATH="$WORKDIR" \
         -e VDE_WORKDIR="$WORKDIR" \
         "${GITENV[@]}" \
+        "${HOSTENV[@]}" \
         "$TOOLS" "$@"
 }
 
@@ -83,6 +89,7 @@ run_docker() {
         -e PYTHONPATH="$WORKDIR" \
         -e VDE_WORKDIR="$WORKDIR" \
         "${GITENV[@]}" \
+        "${HOSTENV[@]}" \
         "$TOOLS" "$@"
 }
 
@@ -96,6 +103,7 @@ run_gpu() {
         -v "$SOCKET:/var/run/docker.sock" \
         -e PYTHONPATH="$WORKDIR" \
         -e VDE_WORKDIR="$WORKDIR" \
+        "${HOSTENV[@]}" \
         "$TOOLS" "$@"
 }
 
@@ -131,12 +139,25 @@ case "$TASK" in
         run python3 "$WORKDIR/tools/check_dist_gate.py" "$@"
         ;;
     size)
+        # Both gate scripts take the image as a flag, so the documented positional
+        # form is translated here rather than at every call site. A call that already
+        # uses flags is passed through unchanged.
         ensure_tools
-        run_docker python3 "$WORKDIR/tools/check_image_size.py" "$@"
+        if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+            run_docker python3 "$WORKDIR/tools/check_image_size.py" "$@"
+        else
+            run_docker python3 "$WORKDIR/tools/check_image_size.py" \
+                --image "$1" "${@:2}"
+        fi
         ;;
     runtime)
         ensure_tools
-        run_docker python3 "$WORKDIR/tools/check_runtime_image.py" "$@"
+        if [ -z "${1:-}" ] || [ "${1#-}" != "$1" ]; then
+            run_docker python3 "$WORKDIR/tools/check_runtime_image.py" "$@"
+        else
+            run_docker python3 "$WORKDIR/tools/check_runtime_image.py" \
+                --image "$1" "${@:2}"
+        fi
         ;;
     measure)
         ensure_tools
@@ -174,6 +195,27 @@ case "$TASK" in
             -e VDE_WORKDIR="$WORKDIR" \
             "$TOOLS" bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq --no-install-recommends gcc libc6-dev >/dev/null && $*"
         ;;
+    warm)
+        # The build-stage half of the JIT decision, run through the harness so the
+        # host stays a launcher. Two things this task supplies that the tool itself
+        # cannot: a C compiler for the run (the tools image has none, per R01, and
+        # triton's build needs gcc plus the C headers), and the arch the cache is
+        # warmed for, read from the card rather than guessed.
+        # shellcheck disable=SC2086
+        docker run --rm \
+            --gpus ${GPUS} \
+            -v "$REPO:$WORKDIR" \
+            -v "$CACHE:/root/.cache" \
+            -e PYTHONPATH="$WORKDIR" \
+            -e VDE_WORKDIR="$WORKDIR" \
+            "${HOSTENV[@]}" \
+            "$TOOLS" bash -c '
+                apt-get update -qq >/dev/null
+                apt-get install -y -qq --no-install-recommends gcc libc6-dev >/dev/null
+                cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d ".")
+                python3 "$VDE_WORKDIR/tools/warm_cache.py" --arch "sm_$cap" "$@"
+            ' bash "$@"
+        ;;
     spike-run)
         # A command in the CUDA devel container. Needed for measurements that
         # require a compiler (triton builds a C extension at runtime) or nvcc.
@@ -202,6 +244,12 @@ case "$TASK" in
         # shellcheck disable=SC2086
         run_gpu bash -c "$*"
         ;;
+    docker)
+        # A docker CLI command inside the container. Used to move content between
+        # images (create + cp) without executing anything on the host.
+        ensure_tools
+        run_docker bash -c "$*"
+        ;;
     pull)
         # Pull an image through the helper so a 401 is reported to the user
         # instead of retried. Nothing is downloaded on the host.
@@ -228,15 +276,19 @@ docker/run.sh <task> [args]
   script <file> [args]  run a repo python script inside the container
   py "<snippet>"        run a snippet inside the container
   dist [args]           distributed gate against the read-only clone
-  size <image> [base]   size + budget gate
-  runtime <image>       runtime image config gate (R01)
+  size <image> [base]   size + budget gate (passes --image / --baseline)
+  runtime <image>       runtime image config gate (R01, passes --image)
   measure <image>       cold start, tokens/s, peak GPU memory
   serve-smoke <image>   fixed-seed inference against a running container
   spike [variant]       libtorch build variants (CUDA devel container)
   spike-run "<command>" run a command in the CUDA devel container (needs a compiler)
   compile "<command>"   run a command with gcc + libc6-dev installed for one run
+  warm [args]           warm the JIT cache on the GPU with a compiler for the run,
+                        arch read from the card, then relocate to the runtime path
   cuda [args]           decide the CUDA series by command, write out/cuda.env
   gpu "<command>"       run a command in the tools container with a GPU attached
+  docker "<command>"    docker CLI command inside the container, for moving
+                        content between images (create + cp)
   pull <image>            pull an image through the helper: a 401 is reported to
                         the user, not retried
   shell                 interactive shell inside the container

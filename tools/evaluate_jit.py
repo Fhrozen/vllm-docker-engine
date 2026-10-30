@@ -100,22 +100,27 @@ def triton_key_for(site_packages: Path) -> str:
 
 
 def count_cache_events(site_packages: Path) -> dict[str, int]:
-    """Wrap the file cache manager so hits and misses are counted, not assumed."""
+    """Wrap the file cache manager so hits and misses are counted, not assumed.
+
+    The lookup that actually decides is has_file(): get_file() and get_group()
+    both go through it, and kernel artifacts are looked up as a group, so
+    wrapping only get_file() undercounts. Measured on a serving run that hit the
+    cache on every kernel: get_file alone reported 110 hits while the cache held
+    439 kernel groups, because group lookups never call get_file().
+    """
     sys.path.insert(0, str(site_packages))
     from triton.runtime import cache as cache_mod
 
-    stats = {"hits": 0, "misses": 0, "puts": 0}
-    original = cache_mod.FileCacheManager.get_file
+    stats = {"lookups": 0, "hits": 0, "misses": 0, "puts": 0}
+    original_has = cache_mod.FileCacheManager.has_file
 
-    def get_file(self, filename):
-        found = original(self, filename)
-        if found is None:
-            stats["misses"] += 1
-        else:
-            stats["hits"] += 1
+    def has_file(self, filename):
+        found = original_has(self, filename)
+        stats["lookups"] += 1
+        stats["hits" if found else "misses"] += 1
         return found
 
-    cache_mod.FileCacheManager.get_file = get_file
+    cache_mod.FileCacheManager.has_file = has_file
 
     original_put = cache_mod.FileCacheManager.put
 
@@ -352,7 +357,8 @@ def main() -> None:
     # Printed even on failure: whether a run hit or compiled is the answer, and a
     # failure that happened after a hit means the cache was not the problem.
     print(
-        f"  cache: hits={stats['hits']} misses={stats['misses']} puts={stats['puts']}"
+        f"  cache: lookups={stats['lookups']} hits={stats['hits']} "
+        f"misses={stats['misses']} puts={stats['puts']}"
     )
     print("  files this run mapped:")
     for path, size in mapped_jit_files(sp):

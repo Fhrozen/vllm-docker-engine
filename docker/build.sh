@@ -38,7 +38,6 @@ VARIANT="engine"
 PACKAGING="thin"
 TAG="vllm-slim:dev"
 BASE="${VDE_RUNTIME_BASE:-ubuntu:24.04}"
-BUILDER="${VDE_CUDA_BUILDER:-python:3.12-slim}"
 FLAVOR="slim"
 ARCH="auto"
 CUDA_SERIES="${VDE_CUDA_SERIES:-auto}"
@@ -46,6 +45,25 @@ CUDA_KEEP="${VDE_CUDA_KEEP:-auto}"
 DRIVER="${VDE_DRIVER_VERSION:-}"
 TARGET_ARCH="linux-x86_64"
 CTX_ONLY=0
+
+# The JIT cache is the one context input that is an artifact rather than a committed
+# file. It is produced by `bash docker/run.sh warm`, which runs the serving workload
+# on the GPU: the runtime image has no C compiler, so the cache has to be built
+# somewhere else, and it has to be built for the card the image will run on.
+# build.sh is a consumer of that run, not the place where the cache is made.
+JIT_CACHE="${VDE_JIT_CACHE:-$REPO/out/jit-cache-ship}"
+# The warm run records which card it warmed for, because the cache key does not
+# contain the arch. Read it rather than assuming it.
+JIT_ARCH="${VDE_JIT_ARCH:-$(cat "$REPO/out/jit-arch.txt" 2>/dev/null || echo none)}"
+
+# VDE_CUDA_BUILDER is the toolchain image: it is where nvcc exists, so it is what
+# the spike and compile tasks use. It is not the pkg stage base. Measured on this
+# machine, `nvidia/cuda:12.8.1-devel-ubuntu24.04` has no python3 and no pip3, so a
+# pkg stage on that base fails at the first lock step with exit 127. The pkg stage
+# only resolves wheels, installs from the wheelhouse, prunes and strips - it needs
+# an interpreter, not a CUDA toolchain - and stage 1 does not survive into the
+# image, so the toolchain has no value there.
+BUILDER="${VDE_PKG_BASE:-python:3.12-slim}"
 
 usage() {
     cat <<USAGE
@@ -55,12 +73,16 @@ usage: bash docker/build.sh [options]
   --packaging engine|thin      packaging variant recorded as a build arg
   --tag NAME:TAG               image tag (default: vllm-slim:dev)
   --base IMAGE                 runtime base, digest-pinned when possible
-  --builder IMAGE              build stage base
+  --builder IMAGE              pkg stage base, default python:3.12-slim (the pkg
+                               stage needs an interpreter; the CUDA toolchain image
+                               has none, so it is not a pkg stage base)
   --flavor NAME                label written into the image title
   --arch LIST|auto             CUDA architectures for the arch filter
   --cuda SERIES|auto           CUDA series, e.g. 12; default is out/cuda.env
   --keep SERIES|auto           which duplicate copy survives; default is out/cuda.env
   --target TRIPLET             wheel platform tag for lock generation
+  --jit-cache DIR              warmed cache to ship (default out/jit-cache-ship)
+  --jit-arch NAME              arch the warm run used, recorded as a label
   --ctx-only                   assemble the context and stop, do not build
 USAGE
 }
@@ -77,6 +99,8 @@ while [ $# -gt 0 ]; do
         --cuda) CUDA_SERIES="$2"; shift 2 ;;
         --keep) CUDA_KEEP="$2"; shift 2 ;;
         --target) TARGET_ARCH="$2"; shift 2 ;;
+        --jit-cache) JIT_CACHE="$2"; shift 2 ;;
+        --jit-arch) JIT_ARCH="$2"; shift 2 ;;
         --ctx-only) CTX_ONLY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage >&2; exit 1 ;;
@@ -103,6 +127,20 @@ else
         cp -a "$REPO/$path" "$CONTEXT/$path" 2>/dev/null || cp -r "$REPO/$path" "$CONTEXT/$path"
     done
 fi
+
+# The cache is required, so a missing one is reported as the step that has to run
+# first rather than turned into an empty folder that the image would ship.
+if [ ! -d "$JIT_CACHE" ]; then
+    echo "no warmed cache at $JIT_CACHE - run: bash docker/run.sh warm" >&2
+    exit 1
+fi
+groups=$(find "$JIT_CACHE" -name '__grp__*.json' | wc -l)
+if [ "$groups" = "0" ]; then
+    echo "cache at $JIT_CACHE has no group files, so nothing in it can hit" >&2
+    exit 1
+fi
+cp -al "$JIT_CACHE" "$CONTEXT/jit-cache" 2>/dev/null || cp -r "$JIT_CACHE" "$CONTEXT/jit-cache"
+echo "jit cache: $JIT_CACHE ($groups groups, arch $JIT_ARCH)"
 
 # CRLF in a script is a runtime failure on a Linux image, not a style issue.
 find "$CONTEXT" -name '*.sh' -type f -print | while read -r file; do
@@ -134,6 +172,7 @@ docker build \
     --build-arg PACKAGING="$PACKAGING" \
     --build-arg VERSION="${TAG#*:}" \
     --label "org.opencontainers.image.title=vllm-${FLAVOR}" \
+    --build-arg JIT_ARCH="$JIT_ARCH" \
     --label "org.opencontainers.image.ref.name=${TAG}" \
     --tag "$TAG" \
     "$CONTEXT"

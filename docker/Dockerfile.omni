@@ -27,10 +27,12 @@ RUN python3 /pkg/packaging/lock.py \
       --rule ${RULE} --target ${TARGET_ARCH} \
       --out /pkg/locks --wheelhouse /pkg/wheelhouse --download
 
+# --name pins the folder for the COPY below; see Dockerfile.vllm for why a
+# Dockerfile cannot name a path derived from the version and the detected arch list.
 RUN python3 /pkg/packaging/package_thin.py \
       --lock /pkg/locks/vllm-omni-${TARGET_ARCH}.txt \
       --wheelhouse /pkg/wheelhouse \
-      --rule ${RULE} --out /pkg/stage \
+      --rule ${RULE} --out /pkg/stage --name package \
       --arch ${CUDA_ARCH}
 
 # ---------------------------------------------------------------------------
@@ -43,7 +45,7 @@ ARG RULE=vllm-omni
 WORKDIR /pkg
 
 COPY packaging/ /pkg/packaging/
-COPY --from=pkg /pkg/stage /opt/omni/
+COPY --from=pkg /pkg/stage/package /opt/omni/
 
 RUN python3 /pkg/packaging/package.py --verify /opt/omni
 

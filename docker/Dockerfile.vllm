@@ -58,9 +58,23 @@ RUN apt-get update \
 # Lock generation is a build-time step. Locks are generated artifacts, not
 # committed files: a lock is only meaningful together with the wheelhouse it
 # was hashed from.
+#
+# The check gate runs here, in the stage that holds both artifacts, and before the
+# install that consumes them. The verify stage is a fresh container: it has the
+# package but not the lock or the wheelhouse, so a check there reads paths that do
+# not exist. Copying the wheelhouse into it would cost 5.3 GB of build time for a
+# gate that has nothing to do with the package.
+# In this path the lock was just written from the wheelhouse, so the hash half of the
+# check is a re-read rather than a cross-run comparison. The half that still matters
+# is the tag gate: a wheel can satisfy its hash and still carry a python, ABI or
+# glibc tag the runtime base cannot run. The cross-run case is a cached lock, where
+# both halves are real.
 RUN python3 /pkg/packaging/lock.py \
       --rule ${RULE} --target ${TARGET_ARCH} \
       --out /pkg/locks --wheelhouse /pkg/wheelhouse --download
+RUN python3 /pkg/packaging/lock.py \
+      --rule ${RULE} --target ${TARGET_ARCH} --check \
+      --out /pkg/locks --wheelhouse /pkg/wheelhouse
 
 # --cuda is the series the detection decided, passed as a variable rather than
 # a default. `auto` here means the wheelhouse itself is read, which is the same
@@ -68,10 +82,14 @@ RUN python3 /pkg/packaging/lock.py \
 # --cuda-keep is the copy that survives the duplicate-folder prune. It is a separate
 # value: the wheelhouse says cu12, this environment resolves cu13, and the tree is
 # smaller if the copy the environment does not use is dropped.
+# --name pins the folder. Without it the package lands under a name derived from the
+# version and the detected arch list, which changes from machine to machine, and a
+# COPY instruction cannot name a path it does not know in advance. The manifest still
+# records version, platform, backend and archs, so pinning the folder loses nothing.
 RUN python3 /pkg/packaging/package_thin.py \
       --lock /pkg/locks/vllm-${TARGET_ARCH}.txt \
       --wheelhouse /pkg/wheelhouse \
-      --rule ${RULE} --out /pkg/stage \
+      --rule ${RULE} --out /pkg/stage --name package \
       --arch ${CUDA_ARCH} --cuda ${CUDA_SERIES} --cuda-keep ${CUDA_KEEP}
 
 # ---------------------------------------------------------------------------
@@ -85,12 +103,10 @@ ARG RULE=vllm
 WORKDIR /pkg
 
 COPY packaging/ /pkg/packaging/
-COPY --from=pkg /pkg/stage /opt/vllm/
+COPY --from=pkg /pkg/stage/package /opt/vllm/
 
 RUN python3 /pkg/packaging/package.py --verify /opt/vllm
 RUN python3 /pkg/packaging/libdeps.py /opt/vllm
-RUN python3 /pkg/packaging/lock.py --rule ${RULE} --check \
-      --out /pkg/locks --wheelhouse /pkg/wheelhouse
 
 # Import smoke on the pruned tree: a prune that removes something the package
 # needs at import time is a bug in the rule, and this is where it shows up.
@@ -107,19 +123,70 @@ ARG CUDA_SERIES=auto
 ARG CUDA_KEEP=auto
 ARG DRIVER=
 ARG PACKAGING=thin
+ARG JIT_ARCH=none
 
 ENV PYTHONPATH=/opt/vllm
 ENV VLLM_USE_PRECOMPILED=0
 ENV VLLM_ENTRY_MODULE=vllm.entrypoints.cli.main
+ENV TRITON_CACHE_DIR=/opt/vde/jit-cache
 
+# The interpreter is a runtime dependency, not a build-time one: entrypoint.sh and
+# healthcheck.sh both run python3, and a boot attempt on a base without it failed at
+# the first exec with "python3: not found". Three ways to put an interpreter in this
+# stage were measured on the same machine (docs/findings.md):
+#   apt python3            38.7 MB over the plain base, works, no ensurepip
+#   copy-only interpreter  32.2 MB, FAILS - _ssl.so from the builder base needs
+#                          OPENSSL_3.3.0 symbols the base's libcrypto does not have
+#   python:3.12-slim base  39.4 MB, works, but ships ensurepip (1.8 MB), which can
+#                          bootstrap pip at runtime and is against R01
+# apt is the option that both works and keeps R01 clean, so it is the one shipped.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g libstdc++6 numactl \
+      tini ca-certificates python3 libgomp1 libatomic1 libnuma1 zlib1g libstdc++6 numactl \
  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=verify /opt/vllm /opt/vllm/
 COPY docker/entrypoint.sh docker/healthcheck.sh /opt/vllm-tools/
 RUN chmod 755 /opt/vllm-tools/entrypoint.sh /opt/vllm-tools/healthcheck.sh
+
+# Loader path, settled by measurement (docs/findings.md). The nvidia libraries
+# arrive as files under the tree and the plain base has no ld.so cache entry for
+# them. torch resolves them through its own $ORIGIN RUNPATH, so the serving path
+# works with nothing here; a direct ctypes.CDLL on vllm/_C.abi3.so does not,
+# because that file carries no RUNPATH. Registering the tree's library folders
+# costs 3,169 bytes of config and 13.2 KB of cache - below the ship-it threshold
+# - and it is the only option that does not depend on import order, so it is the
+# one shipped.
+RUN find /opt/vllm -type d \( -name lib -o -name .libs \) -print \
+      | sort > /etc/ld.so.conf.d/vde-tree.conf \
+ && ldconfig
+
+# The JIT cache is a build artifact, produced by `bash docker/run.sh warm` on the
+# arch this image is for. It is required, not optional: this stage has no C
+# compiler (R01), and Triton checks the cache before it looks for a compiler, so a
+# cold cache here fails at the first kernel build with "Failed to find C compiler".
+# Shipping the cache is what allows the compiler, nvrtc and cupti to be pruned -
+# about 660 MB, measured.
+#
+# The cache is copied to the path its group files were rewritten to. Group files
+# store absolute paths recorded at warm time, so a cache copied without rewriting
+# still works through the fallback in `_get_src()` but costs about 49 s (92.3 s vs
+# 43.6 s, same model, seed and tree). `packaging/cache.py` does the rewrite at
+# build time, which is why the warm step runs before this build. The rewrite keeps
+# each group in its own kernel-hash folder: a flattened form was measured at 92.4 s
+# with puts=872 on the shipped tree, because the stored paths pointed one level
+# above where the group's files actually are.
+#
+# The warm step runs on the tree this stage copies, not on the full install. `strip`
+# changes the cache key - the key hashes `triton/_C/libtriton.so`, and that file is
+# 415.6 MB before strip and 186.6 MB after - so a cache warmed on an unstripped tree
+# produces a key this image will never read.
+#
+# --chown is not cosmetic: uid 1000 has to be able to add entries for kernels this
+# cache does not hold. A read-only cache turns a miss into a write error instead of
+# a rebuild. This COPY sits last because the cache changes more often than the
+# layers above it.
+COPY --chown=1000:1000 jit-cache/ /opt/vde/jit-cache/
 
 LABEL org.opencontainers.image.title="vllm-slim" \
       org.opencontainers.image.source="https://github.com/vllm-project/vllm" \
@@ -129,10 +196,18 @@ LABEL org.opencontainers.image.title="vllm-slim" \
       io.github.vllm-docker-engine.packaging="${PACKAGING}" \
       io.github.vllm-docker-engine.cuda="cu${CUDA_SERIES}" \
       io.github.vllm-docker-engine.cuda-keep="cu${CUDA_KEEP}" \
-      io.github.vllm-docker-engine.driver="${DRIVER}"
+      io.github.vllm-docker-engine.driver="${DRIVER}" \
+      io.github.vllm-docker-engine.jit-cache="${JIT_ARCH}"
 
 VOLUME ["/root/.cache/huggingface"]
 EXPOSE 8000
+
+# The cache is arch-specific even though its key is not: the key is the digest of
+# the compiler sources plus `triton/_C/libtriton.so`, so a cache warmed for sm_80 is
+# read on sm_86 and misses on the cubin. The label records which arch the warm step
+# ran on, so an image that serves a different card is attributable rather than
+# mysteriously slow.
+LABEL io.github.vllm-docker-engine.jit-cache="warm"
 
 USER 1000:1000
 STOPSIGNAL SIGTERM

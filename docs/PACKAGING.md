@@ -256,6 +256,14 @@ imports. That is exactly what happened with `ray`: the importer is reachable, bu
 the serving path never reaches it. A finding is a call to evaluate both sides, not
 proof that the image is broken.
 
+The gate resolves an import to a `.py` file, never to a `.pyi` stub, and that is
+a measured choice rather than a convenience. Treating stubs as targets produced
+324 findings on the real install (`torch/_C/*.pyi`, `triton/_C/libtriton/*.pyi`,
+`tvm_ffi/core.pyi`), and every importer tested in the materialised view imported
+fine with the stub folders gone: the runtime resolves through the compiled `.so`.
+A gate that reports what cannot happen at runtime is not a gate, so `.pyi` stays
+outside the target set.
+
 ## The evaluation
 
 `tools/evaluate_deny.py` answers three questions for each denied name, and each

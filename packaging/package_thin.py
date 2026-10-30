@@ -195,6 +195,9 @@ def build(
     rule: dict,
     archs: list[str],
     cuda_series: int | None = None,
+    cuda_keep: int | None = None,
+    bytecode: str | None = None,
+    name: str | None = None,
 ) -> Path:
     venv = out / (rule["name"] + ".venv")
     if venv.exists():
@@ -204,11 +207,17 @@ def build(
     tree = site_packages(venv)
     dropped = drop_build_path_launchers(venv, wheelhouse)
     print(f"launchers dropped: {dropped}")
+    # The declared series comes from the wheelhouse, the surviving one from the
+    # tree that was just installed. They can disagree, and the prune has to
+    # follow the copy the environment resolves.
+    keep = cuda_keep if cuda_keep is not None else cuda_mod.resolve_keep(None, tree)
+    if keep != cuda_series:
+        print(f"cuda: declared cu{cuda_series}, tree resolves cu{keep}")
 
     # The selection is the shipped set. Read it before the tree is rewritten:
     # a pyc-only rule removes the source files the scan needs to read.
     owner = importscan.top_level_map(tree)
-    selected = set(pkg_mod.select(tree, rule, archs, owner, cuda_series))
+    selected = set(pkg_mod.select(tree, rule, archs, owner, cuda_series, keep))
     hard = importscan.runtime_conflicts(tree, rule, owner, selected)
     dangling = importscan.imports_pointing_at_dropped(tree, selected)
     if hard or dangling:
@@ -219,7 +228,17 @@ def build(
             + "\n  ".join(hard + dangling)
         )
 
-    pkg = pkg_mod.build(tree, rule, out, archs, archive=True, cuda_series=cuda_series)
+    pkg = pkg_mod.build(
+        tree,
+        rule,
+        out,
+        archs,
+        archive=True,
+        cuda_series=cuda_series,
+        cuda_keep=keep,
+        bytecode=bytecode,
+        name=name,
+    )
 
     declared = denied_dependencies(venv, rule)
     if declared:
@@ -253,12 +272,36 @@ def main() -> int:
         "--cuda",
         help="CUDA series to keep, e.g. 12; default is the variables file or wheelhouse",
     )
+    ap.add_argument(
+        "--cuda-keep",
+        help="series whose copy survives in the tree; default is the variables file or the tree",
+    )
+    ap.add_argument(
+        "--bytecode",
+        choices=("source", "pyc-only", "skip"),
+        help="override the rule's bytecode mode for this run",
+    )
+    ap.add_argument(
+        "--name",
+        help="pin the package folder name instead of deriving it from the rule; "
+        "needed by a Dockerfile, which cannot COPY a path it does not know",
+    )
     args = ap.parse_args()
 
     rule = rules_mod.load(args.rule)
     archs = arch_mod.resolve(args.arch)
     series = cuda_mod.resolve(args.cuda, Path(args.wheelhouse))
-    build(Path(args.lock), Path(args.wheelhouse), Path(args.out), rule, archs, series)
+    build(
+        Path(args.lock),
+        Path(args.wheelhouse),
+        Path(args.out),
+        rule,
+        archs,
+        series,
+        cuda_mod.resolve_keep(args.cuda_keep, None),
+        args.bytecode,
+        args.name,
+    )
     return 0
 
 

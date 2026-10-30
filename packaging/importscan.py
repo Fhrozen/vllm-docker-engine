@@ -72,6 +72,14 @@ def module_file(module: str, tree: Path) -> str | None:
     `ray/util/collective/collective_group/cuda_stream.py`, or the package folder
     `.../cuda_stream/__init__.py`. Relative imports are skipped: they resolve
     inside the importing package, not through the tree root.
+
+    Stubs are not targets. `triton/_C/libtriton/linear_layout.pyi` and the
+    `torch/_C/*.pyi` files are type stubs for compiled extensions, and pruning
+    them does not break the import: measured in the materialised selection view,
+    `triton._C.libtriton.linear_layout`, `torch._C._profiler` and `tvm_ffi.core`
+    all resolve to the `.so` and import fine with the stub folders gone. Counting
+    `.pyi` here reported 324 findings that cannot happen at runtime, so the gate
+    keeps `.py` targets only.
     """
     if module.startswith("."):
         return None
@@ -80,6 +88,40 @@ def module_file(module: str, tree: Path) -> str | None:
         if candidate.is_file():
             return candidate.relative_to(tree).as_posix()
     return None
+
+
+def relative_targets(path: Path, tree: Path) -> list[str]:
+    """Tree-relative files a module-level relative import points at.
+
+    `module_file` resolves through the tree root and skips a leading dot, so a
+    target inside the importing package is invisible to it. That is the gap the
+    harness build fell into: `triton/experimental/gluon/language/amd/__init__.py`
+    has `from . import gfx1250`, the arch filter dropped that package, and the
+    gate reported nothing while the image failed at import.
+    """
+    try:
+        parsed = ast.parse(path.read_text(), filename=str(path))
+    except (OSError, SyntaxError, ValueError):
+        return []
+    pkg = path.parent
+    found: list[str] = []
+    for node in parsed.body:
+        if not isinstance(node, ast.ImportFrom) or not node.level:
+            continue
+        base = pkg
+        for _ in range(node.level - 1):
+            base = base.parent
+        for part in (node.module or "").split("."):
+            if part:
+                base = base / part
+        candidates = [base.with_suffix(".py"), base / "__init__.py"]
+        for name in (alias.name for alias in node.names):
+            candidates.extend((base / f"{name}.py", base / name / "__init__.py"))
+        for candidate in candidates:
+            rel = candidate.relative_to(tree).as_posix()
+            if rel != path.relative_to(tree).as_posix() and candidate.is_file():
+                found.append(rel)
+    return found
 
 
 def imports_pointing_at_dropped(
@@ -104,6 +146,12 @@ def imports_pointing_at_dropped(
                 problems.add(
                     f"{rel}: imports {module} at module level, but {target} "
                     "is not in the selection"
+                )
+        for target in relative_targets(tree / rel, tree):
+            if target not in selected:
+                problems.add(
+                    f"{rel}: imports a module inside its own package at module "
+                    f"level, but {target} is not in the selection"
                 )
     return sorted(problems)
 

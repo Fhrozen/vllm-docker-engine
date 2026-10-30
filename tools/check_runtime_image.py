@@ -44,11 +44,67 @@ def inspect(image: str) -> dict:
     return json.loads(out)
 
 
+def runtime_python(image: str) -> tuple[str, bool]:
+    """The interpreter the image actually has, and whether ensurepip can run.
+
+    An interpreter is required rather than forbidden: entrypoint.sh and healthcheck.sh
+    both run one, and a boot on an image without it failed at the first exec with
+    "python3: not found". ensurepip is the opposite - it can bootstrap pip at runtime,
+    so it counts as an installer under R01.
+
+    Both are read as an import/PATH lookup with `|| true`, so a negative result is an
+    empty answer rather than a docker failure.
+    """
+    out = docker(
+        [
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            "found=$(command -v python3 || true); "
+            'if [ -n "$found" ] && python3 -c "import ensurepip" >/dev/null 2>&1; '
+            "then printf '%s ensurepip\\n' \"$found\"; "
+            "else printf '%s\\n' \"$found\"; fi",
+        ]
+    )
+    parts = out.strip().split()
+    return (parts[0] if parts else "", "ensurepip" in parts)
+
+
+def jit_cache_groups(image: str) -> int:
+    """How many JIT cache groups the image carries.
+
+    Triton checks the cache *before* it looks for a compiler, so a pre-warmed cache is
+    what lets a runtime image with no C toolchain serve at all. Measured: a cold cache
+    on such an image fails at `triton/runtime/build.py` with "Failed to find C
+    compiler". Counting group files (`__grp__*.json`) is the check, because a folder
+    that exists but holds no groups is not a cache.
+    """
+    out = docker(
+        [
+            "run",
+            "--rm",
+            "--entrypoint",
+            "/bin/sh",
+            image,
+            "-c",
+            "printf '%s\\n' \"$(find / -name '__grp__*.json' 2>/dev/null | wc -l)\"",
+        ]
+    )
+    return int(out.strip() or 0)
+
+
 def present_tools(image: str, tools: list[str]) -> list[str]:
     """Which forbidden tools are actually present in the image."""
+    # `true` at the end, not a trailing `command -v`: the last check exits 1 when
+    # the tool is absent, which is the pass condition, and a non-zero shell exit is
+    # read as a docker failure rather than an empty result.
     checks = " ".join(
         f"command -v {tool} >/dev/null 2>&1 && printf '%s\\n' {tool};" for tool in tools
     )
+    checks += " true"
     out = docker(["run", "--rm", "--entrypoint", "/bin/sh", image, "-c", checks])
     return sorted({line.strip() for line in out.splitlines() if line.strip()})
 
@@ -65,6 +121,10 @@ def main() -> int:
     rule = rules_mod.load(args.rule)
     config = inspect(args.image)
     tools = present_tools(args.image, rule["forbidden_tools"])
+    python, has_ensurepip = runtime_python(args.image)
+    groups = jit_cache_groups(args.image)
+    compilers = [tool for tool in rule["forbidden_tools"] if tool in ("cc", "gcc", "clang")]
+    compilers_present = [tool for tool in compilers if tool in tools]
 
     problems: list[str] = []
     report: dict = {
@@ -76,11 +136,28 @@ def main() -> int:
         "env": config.get("Env") or [],
         "labels": config.get("Labels") or {},
         "forbidden_tools_present": tools,
+        "interpreter": python or "none",
+        "ensurepip": "present" if has_ensurepip else "absent",
+        "jit_cache_groups": groups,
+        "jit_compiler": "present" if compilers_present else "absent",
         "unverified": list(UNVERIFIED),
     }
 
     if tools:
         problems.append(f"forbidden tools present: {', '.join(tools)}")
+    if not python:
+        problems.append(
+            "image has no interpreter (entrypoint and healthcheck need one)"
+        )
+    if has_ensurepip:
+        problems.append("runtime installer present: ensurepip can bootstrap pip")
+    if groups == 0 and not compilers_present:
+        # Exactly one of the two has to exist for the image to serve: a warm cache or
+        # a C toolchain. The rule forbids the toolchain, so the cache is required.
+        problems.append(
+            "no JIT cache and no C compiler: the first Triton kernel compile fails "
+            "at runtime (measured: 'Failed to find C compiler')"
+        )
     if not report["user"]:
         problems.append("image runs as root (expected USER 1000:1000)")
     if not report["healthcheck"]:
@@ -102,6 +179,11 @@ def main() -> int:
         print(f"entrypoint: {report['entrypoint']}")
         print(f"healthcheck: {report['healthcheck']}")
         print(f"forbidden tools: {'none' if not tools else ', '.join(tools)}")
+        print(f"interpreter: {report['interpreter']} (ensurepip: {report['ensurepip']})")
+        print(
+            f"jit cache: {report['jit_cache_groups']} groups, "
+            f"compiler: {report['jit_compiler']}"
+        )
         print(f"unverified: {', '.join(report['unverified'])}")
         if report.get("base_not_pinned"):
             print(f"warning: base is not digest-pinned ({report['base_not_pinned']})")

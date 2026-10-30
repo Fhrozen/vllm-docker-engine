@@ -49,6 +49,7 @@ PYC_INVALIDATION = {
     "checked-hash": py_compile.PycInvalidationMode.CHECKED_HASH,
     "unchecked-hash": py_compile.PycInvalidationMode.UNCHECKED_HASH,
 }
+DEFAULT_PYC_INVALIDATION = "checked-hash"
 
 
 def sha256(path: Path) -> str:
@@ -68,8 +69,14 @@ def select(
     archs: list[str],
     owner: dict[str, str] | None = None,
     cuda_series: int | None = None,
+    cuda_keep: int | None = None,
 ) -> list[str]:
-    """Relative paths that the rule wants, sorted, no symlinks, no statics."""
+    """Relative paths that the rule wants, sorted, no symlinks, no statics.
+
+    `cuda_series` is what the package declares; `cuda_keep` is the copy the tree
+    actually resolves to. When they differ, the prune follows the surviving copy,
+    because pruning the copy that gets loaded breaks the import.
+    """
     picked: list[str] = []
     want = libdeps.machine_for_platform(rule["platform"])
     for path in sorted(src.rglob("*")):
@@ -82,7 +89,8 @@ def select(
             continue
         if rules_mod.pruned(rel, rule) and not rules_mod.kept(rel, rule):
             continue
-        if rules_mod.cuda_variant(rel, rule, cuda_series):
+        keep = cuda_keep if cuda_keep is not None else cuda_series
+        if rules_mod.cuda_variant(rel, rule, keep):
             continue
         if not rules_mod.matches(rel, rule["allow"]):
             continue
@@ -112,7 +120,18 @@ def resolve_version(src: Path, rule: dict) -> str:
     raise SystemExit(f"version: auto but no dist-info for {rule['name']} under {src}")
 
 
-def package_dir(out: Path, rule: dict, archs: list[str]) -> Path:
+def package_dir(
+    out: Path, rule: dict, archs: list[str], name: str | None = None
+) -> Path:
+    """Package directory name.
+
+    The default name is derived from the rule, so it changes with the version and
+    the detected arch list. That is right for an artifact on disk, but a Dockerfile
+    cannot COPY a path it does not know in advance, so `name` pins the folder while
+    the manifest still records version, platform, backend and archs separately.
+    """
+    if name:
+        return out / name
     parts = [rule["version"], rule["platform"], rule["backend"]]
     if rule.get("arch_filter") == "auto":
         parts.append("-".join(archs))
@@ -133,6 +152,7 @@ def write_manifest(
     archs: list[str],
     entries: list[dict],
     cuda_series: int | None = None,
+    cuda_keep: int | None = None,
 ) -> dict:
     manifest = {
         "schema_version": rule["schema_version"],
@@ -145,6 +165,9 @@ def write_manifest(
         "cuda_series": cuda_series
         if cuda_series is not None
         else rule.get("cuda_series"),
+        "cuda_keep": cuda_keep if cuda_keep is not None else cuda_series,
+        "bytecode": rule.get("bytecode", "skip"),
+        "pyc_invalidation": rule.get("pyc_invalidation", DEFAULT_PYC_INVALIDATION),
         "min_driver": rule.get("min_driver", ""),
         "build_id": build_id(entries),
         "entrypoint": rule["entrypoint"],
@@ -174,7 +197,9 @@ def bytecode_tree(pkg: Path, rule: dict) -> int:
     mode = rule.get("bytecode", "skip")
     if mode == "skip":
         return 0
-    invalidation = PYC_INVALIDATION[rule.get("pyc_invalidation", "checked-hash")]
+    invalidation = PYC_INVALIDATION[
+        rule.get("pyc_invalidation", DEFAULT_PYC_INVALIDATION)
+    ]
     os.environ.setdefault("SOURCE_DATE_EPOCH", str(SOURCE_DATE_EPOCH))
     # A hash pyc validates by hashing the source, so it survives the archive's
     # forced mtime; a timestamp pyc does not, and the runtime user (uid 1000 on
@@ -344,11 +369,16 @@ def build(
     archs: list[str],
     archive: bool,
     cuda_series: int | None = None,
+    cuda_keep: int | None = None,
+    bytecode: str | None = None,
+    name: str | None = None,
 ) -> Path:
     if not src.is_dir():
         raise SystemExit(f"source tree not found: {src}")
     rule["version"] = resolve_version(src, rule)
-    target = package_dir(out, rule, archs)
+    if bytecode:
+        rule["bytecode"] = bytecode
+    target = package_dir(out, rule, archs, name)
     if target.exists():
         raise SystemExit(f"refusing to overwrite existing package: {target}")
     out.mkdir(parents=True, exist_ok=True)
@@ -359,7 +389,9 @@ def build(
     # `cupy_backends`). Without the RECORD owner map a denied distribution still
     # ships, which is what the source-tree variant measured.
     owner = importscan.top_level_map(src)
-    picked = select(src, rule, archs, owner, cuda_series=cuda_series)
+    picked = select(
+        src, rule, archs, owner, cuda_series=cuda_series, cuda_keep=cuda_keep
+    )
     if not picked:
         raise SystemExit("rule selected nothing -- check allow/deny/prune patterns")
 
@@ -389,7 +421,7 @@ def build(
             {"path": rel, "sha256": sha256(path), "bytes": path.stat().st_size}
         )
 
-    manifest = write_manifest(staged, rule, archs, entries, cuda_series)
+    manifest = write_manifest(staged, rule, archs, entries, cuda_series, cuda_keep)
     problems = verify(staged, full=True)
     if problems:
         shutil.rmtree(staged)
@@ -432,6 +464,15 @@ def main() -> int:
         "--cuda",
         help="CUDA series to keep, e.g. 12; default is the variables file or detection",
     )
+    ap.add_argument(
+        "--cuda-keep",
+        help="series whose copy survives in the tree; default is the variables file or the tree",
+    )
+    ap.add_argument(
+        "--bytecode",
+        choices=("source", "pyc-only", "skip"),
+        help="override the rule's bytecode mode for this run",
+    )
     ap.add_argument("--wheelhouse", help="used only to fall back when --cuda is auto")
     ap.add_argument(
         "--archive", action="store_true", help="also write a deterministic tar.gz"
@@ -443,6 +484,11 @@ def main() -> int:
         "--check-archive", action="store_true", help="run the P11 archive gate"
     )
     ap.add_argument("--no-strip", action="store_true")
+    ap.add_argument(
+        "--name",
+        help="pin the package folder name instead of deriving it from the rule; "
+        "needed by a Dockerfile, which cannot COPY a path it does not know",
+    )
     args = ap.parse_args()
 
     if args.check_archive:
@@ -467,7 +513,17 @@ def main() -> int:
     if args.no_strip:
         rule["strip"] = False
 
-    build(Path(args.src), rule, Path(args.out), archs, args.archive, series)
+    build(
+        Path(args.src),
+        rule,
+        Path(args.out),
+        archs,
+        args.archive,
+        series,
+        cuda_mod.resolve_keep(args.cuda_keep, Path(args.src)),
+        args.bytecode,
+        args.name,
+    )
     return 0
 
 

@@ -20,6 +20,7 @@ import pytest
 from conftest import REPO, rule, tree
 
 import arch
+import cache as cache_mod
 import check_dist_gate
 import check_files
 import evaluate_deny
@@ -115,6 +116,10 @@ def test_denied_and_pruned():
         ("gfx1151/kernel.o", ["sm_90a"], False),
         ("sm_86/x.cubin", ["sm_86"], True),
         ("x.cubin", [], True),
+        # source is not filtered: a package folder named for an arch is a module
+        # its parent imports at module level, so dropping it breaks the import
+        ("amd/gfx1250.py", ["sm_90a"], True),
+        ("amd/gfx1250/__init__.py", ["sm_90a"], True),
     ],
 )
 def test_arch_wanted(rel, archs, wanted):
@@ -201,6 +206,46 @@ def test_select_requires_the_allow_list(tmp_path):
     ]
 
 
+def test_prune_follows_the_surviving_copy_not_the_declared_series(tmp_path):
+    # The two values can disagree: the wheelhouse declares cu12 while the tree
+    # resolves cu13. Pruning the copy the environment loads breaks the import, so
+    # the selection follows the surviving copy.
+    tree(
+        tmp_path,
+        {
+            "nvidia_cutlass_dsl/cu12/lib/x.so": "x\n",
+            "nvidia_cutlass_dsl/cu13/lib/y.so": "y\n",
+        },
+    )
+    r = rule(cuda_variant="nvidia_cutlass_dsl")
+    assert package.select(tmp_path, r, [], cuda_series=12, cuda_keep=13) == [
+        "nvidia_cutlass_dsl/cu13/lib/y.so"
+    ]
+    # With no surviving-copy value, the declared series is the only decision.
+    assert package.select(tmp_path, r, [], cuda_series=12) == [
+        "nvidia_cutlass_dsl/cu12/lib/x.so"
+    ]
+
+
+def test_manifest_records_both_series_values_and_the_bytecode_mode(tmp_path):
+    src = tree(tmp_path, {"foo/a.py": "print(1)\n"})
+    pkg = package.build(
+        src,
+        rule(bytecode="source"),
+        tmp_path / "out",
+        ["sm_90a"],
+        archive=False,
+        cuda_series=12,
+        cuda_keep=13,
+    )
+    manifest = json.loads((pkg / package.MANIFEST).read_text())
+    assert manifest["cuda_series"] == 12
+    assert manifest["cuda_keep"] == 13
+    assert manifest["bytecode"] == "source"
+    assert manifest["pyc_invalidation"] == "checked-hash"
+    assert package.verify(pkg) == []
+
+
 def test_resolve_version_auto_reads_dist_info(tmp_path):
     tree(tmp_path, {"PyNvVideoCodec-1.2.3.dist-info/METADATA": "m\n"})
     r = rule(name="pynvvideocodec", version="auto")
@@ -215,6 +260,17 @@ def test_package_dir_names_archs_when_filtered():
     )
     assert package.package_dir(Path("/out"), rule(arch_filter=None), []).name == (
         "1.0-linux-x86_64-cuda"
+    )
+
+
+def test_package_dir_name_can_be_pinned_for_a_dockerfile():
+    # A COPY instruction cannot name a path derived from the version and the
+    # detected arch list, so the build stage pins the folder and the manifest
+    # carries version, platform, backend and archs instead.
+    pinned = package.package_dir(Path("/out"), rule(), ["sm_90a"], "package")
+    assert pinned == Path("/out/package")
+    assert package.package_dir(Path("/out"), rule(), ["sm_90a"], None).name == (
+        "1.0-linux-x86_64-cuda-sm_90a"
     )
 
 
@@ -428,6 +484,40 @@ def test_build_refuses_a_rule_that_selects_nothing(tmp_path):
         package.build(tmp_path / "src", rule(), tmp_path / "out", [], archive=False)
 
 
+def test_relocate_keeps_the_group_own_folder(tmp_path):
+    """A flattened rewrite was measured on the shipped tree at 92.4 s with
+    puts=872, against 48.3 s with puts=0 for the folder-preserving form: the
+    group's files live in the group's own kernel-hash folder, so the stored
+    paths have to keep that folder or get_group() sees dead paths and
+    re-materialises every group.
+    """
+    group = tmp_path / "cache" / "HASH"
+    group.mkdir(parents=True)
+    (group / "__grp__k.json").write_text(
+        json.dumps({"child_paths": {"k.source": "/warm/cache/HASH/k.source"}})
+    )
+    target = Path("/opt/vde/jit-cache")
+    assert cache_mod.relocate(tmp_path / "cache", target) == 1
+    stored = json.loads((tmp_path / "cache" / "HASH" / "__grp__k.json").read_text())
+    assert stored["child_paths"]["k.source"] == str(target / "HASH" / "k.source")
+
+
+def test_verify_resolves_a_relocated_cache_against_the_target(tmp_path):
+    """After the rewrite the stored paths only exist inside the image, so the
+    gate has to compare against the group's folder under the target; checking
+    os.path.exists() alone reported 0 of 212 groups as resolvable.
+    """
+    group = tmp_path / "cache" / "HASH"
+    group.mkdir(parents=True)
+    (group / "__grp__k.json").write_text(
+        json.dumps({"child_paths": {"k.source": "/warm/cache/HASH/k.source"}})
+    )
+    target = Path("/opt/vde/jit-cache")
+    cache_mod.relocate(tmp_path / "cache", target)
+    assert cache_mod.verify(tmp_path / "cache") == (1, 0)
+    assert cache_mod.verify(tmp_path / "cache", target) == (1, 1)
+
+
 # lock --------------------------------------------------------------------
 
 
@@ -507,6 +597,29 @@ def test_check_rejects_a_wheel_outside_the_target(tmp_path):
 
     (wheelhouse / "qux-1.0-cp311-cp311-manylinux_2_17_x86_64.whl").write_text("w\n")
     assert any("python tag" in p for p in lock_mod.check(lock, wheelhouse))
+
+
+def test_tag_rules_read_python_and_abi_as_claims():
+    # abi3 is a promise about versions, so a wheel built for an older
+    # interpreter is usable on the 3.12 target. The old gate rejected every one
+    # of these, including vllm itself.
+    for name in (
+        "vllm-0.17.0-cp38-abi3-manylinux_2_28_x86_64.whl",
+        "tokenizers-0.22.2-cp39-abi3-manylinux_2_17_x86_64.whl",
+        "opencv-5.0-cp37-abi3-manylinux_2_28_x86_64.whl",
+        "triton-3.6.0-cp312-cp312-manylinux_2_27_x86_64.whl",
+        "yaml-6.0-py37-none-any.whl",
+    ):
+        assert lock_mod.tag_problems(name, "linux-x86_64") == []
+
+    # A concrete cpXY wheel is for that interpreter only, py2 claims python 2,
+    # and an abi3 wheel built for a newer interpreter cannot load on 3.12.
+    for name in (
+        "foo-1.0-cp311-cp311-manylinux_2_17_x86_64.whl",
+        "foo-1.0-py2-none-any.whl",
+        "foo-1.0-cp313-abi3-manylinux_2_17_x86_64.whl",
+    ):
+        assert lock_mod.tag_problems(name, "linux-x86_64")
 
 
 def test_download_resolves_for_the_running_environment(monkeypatch, tmp_path):
@@ -715,6 +828,24 @@ def test_gate_reports_a_shipped_file_importing_a_pruned_file(tmp_path):
     ]
 
 
+def test_stub_files_are_not_import_targets(tmp_path):
+    src = tree(
+        tmp_path,
+        {
+            "keepme/api.py": "import keepme.stub\n",
+            "keepme/stub.pyi": "x: int\n",
+        },
+    )
+    r = rule(prune=["**/*.pyi"])
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert "keepme/stub.pyi" not in selected
+    # measured on the real tree: these imports resolve to the compiled extension
+    # (triton/_C/libtriton.so, torch/_C.*.so, tvm_ffi/core.abi3.so), so a pruned
+    # stub cannot break the import and must not be reported as a finding
+    assert importscan.module_file("keepme.stub", src) is None
+    assert importscan.imports_pointing_at_dropped(src, selected) == []
+
+
 def test_a_small_keep_exception_resolves_the_pruned_file_import(tmp_path):
     src = tree(
         tmp_path,
@@ -732,16 +863,36 @@ def test_a_small_keep_exception_resolves_the_pruned_file_import(tmp_path):
     assert not rules.kept("keepme/api.py", r)
 
 
-def test_pruned_file_import_gate_ignores_relative_and_guarded_imports(tmp_path):
+def test_pruned_file_import_gate_resolves_relative_imports(tmp_path):
     src = tree(
         tmp_path,
         {
-            "keepme/api.py": "from . import helper\n\n\ndef f():\n    import os\n",
+            "keepme/api.py": "from . import helper\n\n\ndef f():\n    import helper\n",
             "keepme/helper.py": "x = 1\n",
         },
     )
     r = rule(prune=["**/helper.py"])
     selected = set(package.select(src, r, ["sm_90"]))
+    # the module-level relative import is a finding; the guarded one is not
+    assert importscan.imports_pointing_at_dropped(src, selected) == [
+        "keepme/api.py: imports a module inside its own package at module level, "
+        "but keepme/helper.py is not in the selection"
+    ]
+
+
+def test_arch_filter_keeps_source_a_package_imports(tmp_path):
+    src = tree(
+        tmp_path,
+        {
+            "pkg/amd/__init__.py": "from . import gfx1250\n",
+            "pkg/amd/gfx1250/__init__.py": "x = 1\n",
+            "pkg/amd/gfx1250/kernel.cubin": "data",
+        },
+    )
+    r = rule()
+    selected = set(package.select(src, r, ["sm_90"]))
+    assert "pkg/amd/gfx1250/__init__.py" in selected
+    assert "pkg/amd/gfx1250/kernel.cubin" not in selected
     assert importscan.imports_pointing_at_dropped(src, selected) == []
 
 

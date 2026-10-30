@@ -124,6 +124,7 @@
   "runtime_apt": [
     "tini",
     "ca-certificates",
+    "python3",
     "libgomp1",
     "libatomic1",
     "libnuma1",

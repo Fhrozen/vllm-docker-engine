@@ -162,6 +162,30 @@ def resolve(value: str | None, wheelhouse: Path | None = None) -> int | None:
     return None
 
 
+def resolve_keep(value: str | None, tree: Path | None = None) -> int | None:
+    """The series whose copy survives in the tree, as opposed to the one declared.
+
+    The declared series is what the image says; the surviving series is what the
+    environment resolves. They can differ (the wheelhouse is cu12 while
+    `nvidia_cutlass_dsl` resolves cu13), and pruning must follow the copy that
+    is actually loaded, not the label. Order: an explicit value, then the
+    variables file, then the tree, then the declared series.
+    """
+    if value and value != "auto":
+        match = re.search(r"\d+", value)
+        if not match:
+            raise SystemExit(f"cuda: cannot read a series from {value!r}")
+        return int(match.group(0))
+    env = os.environ.get("VDE_CUDA_KEEP")
+    if env and env.isdigit():
+        return int(env)
+    if tree is not None:
+        series, _ = tree_series(tree)
+        if series is not None:
+            return series
+    return None
+
+
 def user_override(explicit: str | None = None) -> tuple[int | None, int | None, str]:
     """The CUDA version the user set, read from ``--cuda`` or ``VDE_CUDA``.
 

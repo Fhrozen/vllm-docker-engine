@@ -117,8 +117,18 @@ def arch_wanted(name: str, archs: list[str]) -> bool:
     """Data files named for another architecture are left out.
 
     Shared files, meaning those with no arch in the name, stay.
+
+    Source is not filtered. A package folder named for an architecture is a
+    module its parent imports at module level, so dropping it is a runtime
+    ImportError rather than a saving: `triton/experimental/gluon/language/amd/
+    __init__.py` has `from . import gfx1250`, and the harness build that dropped
+    it failed at that line. Measured on the real tree for sm_86, the source the
+    filter would drop is 7 files / 14.2 KB, three of them reached by a
+    module-level import - below the ship-it threshold, so the filter is data-only.
     """
     if not archs:
+        return True
+    if name.endswith(".py"):
         return True
     named = arch_of(name)
     if named is None:

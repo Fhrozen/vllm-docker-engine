@@ -110,9 +110,76 @@ def current_environment() -> dict[str, str]:
     }
 
 
-def python_tags(target: str) -> tuple[str, ...]:
-    version = TARGETS[target]["python_version"].replace(".", "")
-    return (f"cp{version}", f"py{version}", "py3")
+PY_TAG = re.compile(r"^(cp|py)(\d+)$")
+
+
+def _minor(digits: str) -> int | None:
+    """Version a tag part claims as a python 3 minor; None for a bare `py3`.
+
+    `py37` claims support from 3.7 upward, so it is usable on 3.12. `py2` claims
+    python 2 only, so it is not a python 3 claim at all and the callers skip it.
+    """
+    if digits == "3":
+        return None
+    if digits.startswith("3"):
+        return int(digits[1:])
+    return None
+
+
+def _runtime_minor(target: str) -> int:
+    return int(TARGETS[target]["python_version"].split(".")[1])
+
+
+def python_ok(tag: str, target: str, abi: str = "none") -> bool:
+    """Read a python field as a claim about versions, not as a name to match.
+
+    The old gate compared the field against the target's own version, which
+    rejected every `cpXY-abi3` wheel - the abi3 wheels are exactly the ones that
+    work on a newer interpreter. Measured on the real wheelhouse, that was 19 of
+    195 wheels, including vllm itself.
+
+    A `cpXY` field is the interpreter the wheel was built for, so it is only
+    usable on that version unless the abi field says the wheel is stable-ABI. A
+    `pyXY` field claims pure-python support from XY upward, so `py37` is usable
+    on 3.12 while `py2` is not.
+    """
+    runtime = _runtime_minor(target)
+    spec = TARGETS[target]
+    for part in tag.split("."):
+        m = PY_TAG.match(part)
+        if not m or not m.group(2).startswith("3"):
+            continue
+        minor = _minor(m.group(2))
+        if m.group(1) == "cp":
+            if abi == "abi3":
+                if minor is None or minor <= runtime:
+                    return True
+            elif spec["implementation"] == "cp" and minor == runtime:
+                return True
+        elif minor is None or 3 <= minor <= runtime:
+            return True
+    return False
+
+
+def abi_ok(abi: str, python_tag: str, target: str) -> bool:
+    """abi3 is a promise about versions, so it is read against the python field."""
+    runtime = _runtime_minor(target)
+    spec = TARGETS[target]
+    if abi == "none":
+        return True
+    if abi == "abi3":
+        if spec["implementation"] != "cp":
+            return False
+        for part in python_tag.split("."):
+            m = PY_TAG.match(part)
+            if not m or not m.group(2).startswith("3"):
+                continue
+            minor = _minor(m.group(2))
+            if minor is None or minor <= runtime:
+                return True
+        return False
+    m = PY_TAG.match(abi)
+    return bool(m) and _minor(m.group(2)) == runtime
 
 
 def _floor(part: str) -> tuple[tuple[int, int], str] | None:
@@ -149,9 +216,11 @@ def tag_problems(filename: str, target: str) -> list[str]:
         return [f"{filename}: not a wheel filename"]
     spec = TARGETS[target]
     problems = []
-    if m.group("python") not in python_tags(target):
-        problems.append(f"{filename}: python tag {m.group('python')} not in {target}")
-    if m.group("abi") not in spec["abi"]:
+    if not python_ok(m.group("python"), target, m.group("abi")):
+        problems.append(
+            f"{filename}: python tag {m.group('python')} not accepted by {target}"
+        )
+    if not abi_ok(m.group("abi"), m.group("python"), target):
         problems.append(
             f"{filename}: abi tag {m.group('abi')} not accepted by {target}"
         )

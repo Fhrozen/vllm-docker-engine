@@ -153,12 +153,30 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   time, so that tree stays too. `cuda_nvrtc` and cupti are only used
   when a kernel is compiled or profiled, so a warm-cache image can drop
   them.
-- The cache key is the digest of the compiler source files, so pruning
-  them changes the key. Pruning `.py` files under `compiler/` or
-  `backends/` does **not** change it (measured: `3.6.00355c3e3452`
-  with and without `triton/backends/amd`), and env vars do not either
-  (`get_cache_invalidating_env_vars()` returns `{}`). Measure each tree
-  in its own process, because `triton_key()` reads files from disk.
+- The cache key is the digest of the compiler source files **and of
+  `triton/_C/libtriton.so`**, so pruning them changes the key — and so does
+  `strip` (measured: 415,617,000 B → 186,568,112 B, hash prefix
+  `28daaa70a904e4f8` → `31952e683c13e95a`). The cache must therefore be warmed
+  on the tree that ships, i.e. the stripped build, with the C headers put back
+  for the run (headers are `.h`, not key inputs). Pruning `.py` files under
+  `compiler/` or `backends/` does **not** change the key (measured:
+  `3.6.00355c3e3452` with and without `triton/backends/amd`), and env vars do
+  not either (`get_cache_invalidating_env_vars()` returns `{}`). Measure each
+  tree in its own process, because `triton_key()` reads files from disk — and
+  compare the **full** key, not the first 16 characters, which is only the
+  triton version plus the compiler-source digest.
+- A shipped cache must be **relocated**, not just copied. Group files
+  (`__grp__<name>.json`) store absolute paths recorded at warm time, and
+  `get_group()` checks `os.path.exists()` on those stored paths. A cache warmed at
+  one path and read at another still works — `_get_src()` falls back to rebuilding
+  paths from the cache dir — but the fallback costs time: measured 92.3 s vs 43.6 s
+  on the same model and seed with the recorded path absent. `packaging/cache.py`
+  rewrites the group files to the runtime path at build time, which keeps the fast
+  path. Measure relocation with the original path deleted; leaving it in place makes
+  a moved cache hit by reading the original folder, which is a false pass.
+  The rewrite must **keep each group's own kernel-hash folder**: a flattened
+  `<target>/<name>` form was measured at 92.4 s with puts=872, against 48.3 s with
+  puts=0 for the folder-preserving form on the shipped tree.
 - Shipped bytecode must be hash-based. The runtime container runs as uid 1000 on a
   root-owned `0o555` tree, so `__pycache__` is never rebuilt at launch, and the
   deterministic archive forces `mtime = SOURCE_DATE_EPOCH`, which invalidates every

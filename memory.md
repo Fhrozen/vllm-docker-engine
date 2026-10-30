@@ -94,6 +94,8 @@ Everything below ran inside the container (`bash docker/run.sh ...`), not on the
 | the same tool on the timestamp build, same tree before and after forcing the mtime | valid 4.9 s, invalid 6.3 s (+1.4 s); 3 runs on the invalid tree → median 6.19 s. The +1.5 s penalty stands. The gap between 6.19 s and the 2.75 s hash build is not explained by validation cost (hash vs stat) and is not claimed as a reason to prefer hash pycs |
 | pyc-only build through the same tool | `namespace package: no code ran`, 0.019 s — an import that proves nothing. `timed_import` now checks `vllm.__file__` instead of only the exit code |
 | new tool `tools/measure_startup.py` | prints pyc validity as delivered, then the entry import as uid 1000 and the module count; reuses `tools/evaluate_bytecode.py`. Gate clean on it |
+| `.pyi` stubs as import targets, evaluated on both sides | counting stubs gave 324 findings on the real install (`torch/_C/*.pyi`, `triton/_C/libtriton/*.pyi`, `tvm_ffi/core.pyi`); the importers tested in the materialised view (`triton.tools`, `torch.profiler`, `torch.utils.data`, `tvm_ffi.dataclasses`, `vllm.compilation.wrapper`) all import fine with the stub folders gone, because the runtime resolves through the compiled `.so`. The change was reverted and the gate re-run: 0 findings |
+| `gate` on `packaging/importscan.py` `tests/test_packaging.py` `docs/PACKAGING.md` `memory.md` | first run FAILED on one 82-character prose line in `docs/PACKAGING.md` (MD013). After rewrapping: clean, 0 issues. `test` on `tests/test_packaging.py`: 106 passed (105 + the new `test_stub_files_are_not_import_targets`) |
 
 ### Build runs
 
@@ -199,6 +201,109 @@ What the runs showed:
   `torch/utils/cpp_extension.py`, `numba/pycc/**`, `flashinfer/data/**` setup
   scripts, `build_backend.py` — so those files are prune candidates rather than a
   reason to ship setuptools.
+
+**Build #3 — CUDA decided by command, first end-to-end three-stage run.**
+
+- `bash docker/run.sh cuda` writes `out/cuda.env`. Measured on this host: driver
+  580.95.05, driver CUDA ceiling 13.0, no `nvcc` on PATH (the tools image has no
+  CUDA toolkit), wheelhouse series 12, tree series 13 — the cutlass tree holds both
+  `cu12/` and `cu13/`. No user override, so the wheelhouse wins over the tree:
+  `VDE_CUDA_SERIES=12` (declared), `VDE_CUDA_KEEP=13` (surviving), builder
+  `nvidia/cuda:12.8.1-devel-ubuntu24.04`, runtime base
+  `nvidia/cuda:12.8.1-base-ubuntu24.04`.
+- Build #1 failed at the pkg stage with `/bin/sh: 1: python3: not found` (exit 127).
+  Measured: `nvidia/cuda:12.8.1-devel-ubuntu24.04` has **no python3 and no pip3**.
+  Fix: the pkg stage base is `VDE_PKG_BASE` (default `python:3.12-slim`); the CUDA
+  devel image is the toolchain image for spike/compile tasks, not the packaging stage.
+- Loader path implemented in the runtime stage (option 2, `ld.so.conf.d` + `ldconfig`)
+  after confirming `/usr/bin/find` and `/usr/sbin/ldconfig` exist in `ubuntu:24.04`.
+  `LD_LIBRARY_PATH` is deliberately not set, so the config file is the only mechanism.
+- Build #2 failed at the pkg stage with `unrecognized arguments: --cuda-keep 13`.
+  Fix: `cuda.resolve_keep()` plus `--cuda-keep` and `--bytecode` on both packaging
+  CLIs, and `cuda_keep` threaded through `select()`, `write_manifest()` and `build()`.
+  `--cuda-keep auto` resolves from the tree, so the build stage and the packaging CLI
+  agree without a hand-written value.
+- Build #3 (`bash docker/run.sh build --variant thin`, log `out/build-run.log`):
+  lock 195 entries, install ok, `launchers dropped: 0`,
+  `cuda: declared cu12, tree resolves cu13` — the two-series split is live in the
+  build, and the prune follows the surviving series.
+  The pkg stage ran clean end to end: `files: 47925 bytes: 10058080767`,
+  archive 5160192182 bytes, `gate: no uncovered imports`, ninja-only notes.
+- Build #3 then failed in the **verify** stage: `FileNotFoundError: /opt/vllm/manifest.json`.
+  Cause: `--out` is the parent directory, and the package lands in a subdirectory
+  named `<version>-<platform>-<backend>-<archs>`, so `COPY --from=pkg /pkg/stage`
+  put the parent in the image and the manifest was one level deeper.
+  Fix: `package_dir(..., name)` + `--name` on both CLIs, and the Dockerfiles pin
+  `--name package` with `COPY --from=pkg /pkg/stage/package`. A COPY instruction
+  cannot name a path derived from the version and the detected arch list, and the
+  manifest already records version, platform, backend and archs separately, so
+  pinning the folder loses nothing. Same fix applied to `Dockerfile.omni`.
+  Gate clean on the five changed files; tests 136 passed.
+
+**Build #4 — the check gate ran in a stage that does not hold its inputs.**
+
+- Failed in the verify stage: `FileNotFoundError: /pkg/locks/vllm-linux-x86_64.txt`.
+  The verify stage is a fresh container that has the package but not the lock or the
+  wheelhouse, so a check there reads paths that do not exist.
+- Fix: the check gate moved to the **pkg stage**, after `--download` and before the
+  install — the stage that holds both artifacts. Copying the 5.3 GB wheelhouse into
+  the verify stage would cost build time for a gate unrelated to the package. In this
+  path the hash half is a re-read; the half that still matters is the tag gate, and
+  both halves are real for a cached lock.
+  Gate clean on `docker/Dockerfile.vllm`.
+
+**Build #5 — the tag gate was wrong, not the data.**
+
+- The gate failed with 19 python-tag findings on a wheelhouse that is legitimately
+  for this target. `python_tags()` returned only `cp312`, `py312`, `py3`, so every
+  `cpXY-abi3` wheel was rejected — 19 of 195 wheels, including vllm itself,
+  tokenizers, safetensors, protobuf, psutil, opencv, tilelang, hf_xet, llguidance,
+  watchfiles, cryptography, humming_kernels, openai_harmony, oss_harmony.
+  `linux-x86_64` is a platform, not a python version, and the gate was comparing a
+  name rather than reading the claim.
+- Fix: `python_ok()` and `abi_ok()` read the fields as claims about versions.
+  `cpXY-abi3` is usable on 3.12 when XY <= 3.12; `py37-none-any` is usable because
+  `py37` claims 3.7 upward; `py2-none-any` is not, because `py2` claims python 2
+  only; `cp313-abi3` is not, because a stable-ABI wheel built for a newer
+  interpreter cannot load on 3.12; a concrete `cp311-cp311` is still rejected.
+  `python_tags()` is gone (it had no other caller).
+- Re-run on the real data: `lock check: clean (out/locks/vllm-linux-x86_64.txt)`,
+  with the unchanged `requirements: 3 denied name(s) not downloaded` note.
+  Gates clean on `packaging/lock.py` and `tests/test_packaging.py`; tests **137 passed**
+  (new test `test_tag_rules_read_python_and_abi_as_claims`).
+
+**Build #6 — the first build that reached the end of all three stages.**
+
+- `bash docker/run.sh build --packaging thin` → `Successfully built 05198e62551e`,
+  tagged `vllm-slim:dev`. Every stage ran, including the gates that stopped the
+  previous four runs.
+- pkg stage: `lock: /pkg/locks/vllm-linux-x86_64.txt (195 entries)`, check gate clean,
+  install ok, `launchers dropped: 0`, `cuda: declared cu12, tree resolves cu13`,
+  selection **47,925 files / 10,058,113,757 B**, archive **5,160,222,411 B**
+  (51.3% of the tree), uncovered-import gate clean, deny gate 0 findings with the
+  two known ninja notes.
+- verify stage: `verify: clean (/opt/vllm)` and the import smoke printed
+  `0.17.0`.
+- Image: **9.45 GiB unpacked** (the size tool reports GiB; 9.45 GiB = 10.16 GB
+  decimal, which is the pkg-stage tree 9.37 GiB plus the base layers), baseline
+  21.80 GiB, **reduction 56.6%** → gate **FAIL** on both halves (needs < 6.00 GiB
+  and >= 60%). Compressed download is UNVERIFIED: the size tool cannot read a local
+  image's compressed layers without a registry push.
+- Runtime gate (R01) on the image: **PASS** — no forbidden tool present, user
+  `1000:1000`, tini entrypoint, healthcheck present.
+- Two tool bugs found by running the gates on the real image, both fixed:
+  `check_runtime_image.py` read a clean result as a docker failure, because the last
+  `command -v` in the check chain exits 1 when the tool is absent — which is the pass
+  condition — so the shell now ends with `true`; and `docker/run.sh` passed the image
+  as a positional argument to gates that require `--image`, so the documented
+  positional form is now translated to the flag (a call that already uses flags is
+  passed through unchanged).
+- ptxas is present in the image (`triton/backends/nvidia/bin/ptxas` 30.4 MB,
+  `tokenspeed_triton/.../ptxas` 49.6 MB), so the JIT path is not broken by the prune:
+  `nvidia/*/bin/**` matches nothing in this tree — the only `bin` files are under
+  `torch/bin` and `*/backends/nvidia/bin` (8 files, 135.9 MB), and the pattern needs
+  a segment between `nvidia` and `bin`. `ptxas-blackwell` (33.3 MB) is still shipped
+  and is not needed for `sm_86`.
 
 ### Evaluation (the measurement phase)
 
@@ -552,3 +657,27 @@ a tenth.
     `package_thin.build()` passes `str(rel)`, `compare_packaging.py` passes a
     `pathlib.Path`; both work, and the gate's docstring says paths must be
     relative to the tree root.
+13. The gate resolves imports to `.py` files only, and that is a measured choice:
+    adding `.pyi` to the target set produced 324 findings on the real install, all
+    of them stubs for compiled extensions. Tested in the materialised view with the
+    stub folders pruned, `triton._C.libtriton.linear_layout`, `torch._C._profiler`
+    and `tvm_ffi.core` resolve to the `.so` and import fine, as do the importers
+    (`triton.tools`, `torch.profiler`, `torch.utils.data`, `tvm_ffi.dataclasses`,
+    `vllm.compilation.wrapper`). Gate stays at 0 findings; the test
+    `test_stub_files_are_not_import_targets` keeps it that way.14. **JIT cache, closed by measurement.** Two things the harness exposed:
+    - `strip` changes the cache key, because the key hashes `triton/_C/libtriton.so`
+      (415,617,000 B → 186,568,112 B, prefix `28daaa70a904e4f8` → `31952e683c13e95a`).
+      The warm step now runs on the tree that ships, with the C headers put back for
+      the run (`tools/warm_cache.py::warm_view`, headers are `.h` so they are not key
+      inputs). End-to-end run `out/warm-ship2.txt`: keys agree True, gate PASS.
+    - `relocate()` must keep each group in its own kernel-hash folder. A flattened
+      rewrite was measured on the shipped tree at 92.4 s with puts=872; the
+      folder-preserving form serves in 48.3 s with `hits=219 misses=0 puts=0`
+      (`out/jit-runtime-hit2.txt`). `verify()` now compares against the group's
+      folder under the target, not the target itself — `os.path.exists()` alone
+      failed all 212 groups after a rewrite, because the paths only resolve inside
+      the image. Tests: `test_relocate_keeps_the_group_own_folder`,
+      `test_verify_resolves_a_relocated_cache_against_the_target`.
+    Gates on the changed files (`packaging/cache.py tools/warm_cache.py
+    docs/findings.md docker/Dockerfile.vllm memory.md tests/test_packaging.py`):
+    clean; suite 141 → 143 passed.
