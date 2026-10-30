@@ -324,6 +324,68 @@ reporting path is proven by the fabricated case and the local-image case only.
 - The honest floor for a GPU image is ~2.5–3.5 GB. A tenth of the baseline is
   not reachable; the achievable reduction is ~60–70%.
 
+## Bytecode: what ships, and whether it runs
+
+Short answer: **source stays in the image.** Both ideas behind a
+bytecode-only image were run, and both fail; the saving is small.
+
+Measured with `tools/evaluate_bytecode.py` on the delivered source package
+(`out/compare-cupy2/source/engine`):
+
+- The tree already carries 24,079 `.pyc` (394.9 MB) and the selection keeps
+  21,064 (338.2 MB). A `source` build ships both forms, so the cache is not a
+  new cost — it is already there.
+- `__pycache__` is not rebuilt at launch. The runtime stage runs as uid 1000
+  on a root-owned tree with members at `0o555`, so the cache cannot be
+  written: the import succeeds and no pyc is written.
+- `docker COPY` preserves mtimes, so the runtime image keeps whatever the
+  verify stage produced.
+- The deterministic archive sets `mtime = SOURCE_DATE_EPOCH` on every member,
+  which invalidates every timestamp pyc it carries: 21,054 of 21,064 read as
+  invalid after the forced mtime.
+- Hash-based pycs are validated by hashing the source (blake2b, 8 bytes), so
+  they survive the forced mtime. Recompiling the whole cache as checked-hash
+  gives 21,061 valid pycs, 337.0 MB, 70.1 s of compile.
+- What an invalid cache costs on a read-only tree: 4.9 s against 6.3 s for the
+  entry import on the same tree before and after forcing the mtime (1,665
+  modules executed), so about +1.4 s per start. Three repeats on the invalid
+  tree give 6.19 s median. The delivered checked-hash build, read the same way
+  as uid 1000, gives 2.75 s median. The gap between those two is not explained
+  by validation cost — a hash of the source rather than a stat — so it is
+  reported as a measurement, not as a reason to prefer hash pycs. The reason to
+  prefer them is that they stay valid after extraction.
+- `compileall` ignores the string form of `invalidation_mode` and still writes
+  unchecked-hash pycs; the enum `py_compile.PycInvalidationMode.CHECKED_HASH`
+  is what actually produces flags 3.
+- `compileall` skips a cache it considers valid, so `CHECKED_HASH` does not
+  rewrite a timestamp pyc the source tree already carries: on a probe the flags
+  stayed 0 while a fresh build wrote 3. `bytecode_tree()` therefore drops the
+  `__pycache__` pycs before compiling whenever the invalidation is hash-based.
+
+Three facts make a bytecode-only image unusable:
+
+- A sourceless pyc in `__pycache__` is not importable at all. The delivered
+  pyc-only build imports as a namespace package (`vllm.__file__ is None`), so
+  no code runs. The layout that does work is the legacy one, with the pyc at
+  the module's own location (`pkg/mod.pyc`).
+- Source is read at import time. `torch/fx/experimental/_config.py` calls
+  `inspect.getsource()` through `install_config_module()`, which raises
+  `OSError: could not get source code` on a sourceless tree. 68 shipped files
+  use `inspect.getsource`/`getsourcelines`/`getsourcefile`; one runs at module
+  level (`torch/_dynamo/eval_frame.py`), and the torch case is a module-level
+  call into a function body, so a static scan cannot find all of them.
+- The import check has to say so explicitly. A folder with no source imports
+  successfully as a namespace package without executing anything, so a check
+  that only looks at the return code reports a pass. `import_smoke()` now
+  requires `__file__` to resolve, and `tools/measure_startup.py <package dir>`
+  prints `namespace package: no code ran` for the pyc-only build, which
+  measures 0.019 s that way — an import that proves nothing.
+
+The size side does not rescue it. Source build: 10,102.7 MB unpacked and
+5,155.1 MB archive. Pyc-only: 9,798.0 MB unpacked and 5,099.9 MB archive. The
+download difference is 55.2 MB, below the "a few MB, ship it" threshold, so
+source is kept.
+
 ## Open decisions
 
 Each of these is undecided by design and will be settled by running
@@ -334,10 +396,22 @@ recorded in the section above rather than here.
 | --- | --- |
 | Loader path | import order, `ld.so.conf.d` + `ldconfig`, or RUNPATH rewrite |
 | CUDA version the image declares | read by command: ceiling vs wheelhouse |
-| `.pyc`-only or source ship | startup latency vs +27.7 MB |
+| `.pyc`-only or source ship | settled: source is kept (see above) |
+| cache invalidation mode | settled: checked-hash, in `bytecode_tree()` |
+| partial deny | settled: no measured case, all-or-nothing is enough |
 | Packaging variant | `tools/compare_packaging.py` after both are measured |
 | cutlass cu12 vs cu13 prune | which copy the loader resolves, both measured |
 | tilelang / flashinfer | pruned by default, kept as an opt-in flavor |
 
 The cutlass decision is settled in mechanism and open in value: the choice is
 which copy the environment resolves, and both branches have been measured above.
+
+Partial deny was evaluated on the only distribution the rule denies (cupy).
+All-or-nothing keeps the whole 291.2 MB cupy-side tree out. Partial deny — deny
+the distribution except its non-cutensor modules — would ship 289.6 MB back for
+a 1.6 MB cutensor-linked `.so` that still cannot load, because its dependency
+(`libcutensor.so.2`) is a shared library outside the denied package, not a file
+inside it. More bytes, same broken import, so all-or-nothing stands. The deny
+gate reports 0 findings on the real tree, meaning no shipped file needs a denied
+distribution today; if that ever changes, the gate reports it and partial deny
+becomes the thing to measure.

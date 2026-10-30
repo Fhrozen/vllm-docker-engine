@@ -50,7 +50,8 @@
     "**/test-data/**",
     "**/testdata/**"
   ],
-  "bytecode": "pyc-only",
+  "bytecode": "source",
+  "pyc_invalidation": "checked-hash",
   "strip": false,
   "arch_filter": "auto",
   "system_libs": [],

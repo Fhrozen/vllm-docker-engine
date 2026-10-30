@@ -48,16 +48,25 @@ def row(name: str, pkg: Path, rule: dict) -> dict:
 
 
 def import_smoke(pkg: Path, module: str) -> str:
+    """Import the module and require that code actually ran.
+
+    A folder holding only bytecode imports as a namespace package, which a plain
+    return code accepts. ``__file__`` has to resolve for the import to mean
+    anything.
+    """
     env = dict(os.environ, PYTHONPATH=str(pkg))
+    code = (
+        f"import {module}; "
+        f"print('ok' if getattr({module}, '__file__', None) else "
+        f"'namespace package: no code ran')"
+    )
     result = subprocess.run(
-        [sys.executable, "-c", f"import {module}; print('ok')"],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         check=False,
         env=env,
     )
-    if result.returncode == 0:
-        return "ok"
     text = (result.stdout + result.stderr).strip()
     return text.splitlines()[-1] if text else "no output"
 

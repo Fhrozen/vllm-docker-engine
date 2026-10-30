@@ -14,7 +14,12 @@ A rule file is JSON. Keys:
   keep          - exceptions to prune: files a shipped file imports at module
                   scope, kept when they are small enough that shipping them is
                   cheaper than breaking the import
-  bytecode      — "source" or "pyc-only"
+  bytecode      — "source" or "pyc-only". `pyc-only` is measured as unusable:
+                  a sourceless pyc in `__pycache__` is not importable, and the
+                  layout that is importable breaks on `inspect.getsource()`.
+  pyc_invalidation — "timestamp", "checked-hash" or "unchecked-hash". Hash pycs
+                  survive the archive's forced mtime; timestamp pycs do not, and
+                  the runtime user cannot rebuild the cache.
   strip         — run `strip --strip-debug` on ELF files as an explicit pipeline step
   arch_filter   — "auto" (detected by command) or a list of CUDA architectures
   cuda_variant  — folder that ships one copy per CUDA series (e.g.

@@ -12,7 +12,8 @@ The order matters, so it is fixed:
 2. select files (`select()`): deny, prune, static artifacts, symlinks, arch filter
 3. stage into `<target>.partial` — an existing target is refused, never overwritten
 4. `strip --strip-debug` — an explicit step, not a side effect
-5. bytecode (`bytecode_tree`), honouring `SOURCE_DATE_EPOCH`
+5. bytecode (`bytecode_tree`), honouring `SOURCE_DATE_EPOCH` and the rule's
+   `pyc_invalidation`
 6. hash the staged tree, in sorted order
 7. write `manifest.json`
 8. `verify(full=True)` — re-hash, refuse symlinks and unlisted files
@@ -41,7 +42,8 @@ skips it — the manifest can only vouch for the files it names.
   "allow": ["**"],
   "deny": ["pip"],
   "prune": ["**/tests/**", "**/*.a"],
-  "bytecode": "skip",
+  "bytecode": "source",
+  "pyc_invalidation": "checked-hash",
   "strip": true,
   "arch_filter": "auto",
   "cuda_variant": "nvidia_cutlass_dsl",
@@ -108,6 +110,52 @@ the same rule and arch, `pyc-only` is the smaller package: 9,798.0 MB against
 A tree that already carries bytecode is therefore not a neutral input: the
 selection keeps the `.pyc` files it finds, and the mode decides whether the source
 form is delivered alongside them.
+
+### What the runtime does with it
+
+Measured with `tools/evaluate_bytecode.py`, on the delivered engine package:
+
+- `__pycache__` is not rebuilt at launch. The runtime stage runs as uid 1000 on
+  a root-owned tree whose members are `0o555`, so the cache cannot be written:
+  the import succeeds and nothing is added.
+- `docker COPY` preserves mtimes, so the image keeps whatever the verify stage
+  produced.
+- The deterministic archive sets `mtime = SOURCE_DATE_EPOCH` on every member,
+  which invalidates every timestamp pyc it carries — 21,054 of 21,064. A cache
+  that fails validation is recompiled in memory on each start. Measured on the
+  same tree before and after forcing the mtime: 4.9 s against 6.3 s for the
+  entry import as uid 1000, 1,665 modules executed. Repeating each run three
+  times on the same tree gives 6.19 s median for the invalid cache.
+- Hash-based pycs are validated by hashing the source (blake2b, 8 bytes), so
+  they survive the forced mtime, and the delivered checked-hash build imports in
+  2.75 s median (3 runs). That is below the valid-timestamp reading above; the
+  gap is not explained by validation cost, which is a hash of the source rather
+  than a stat, so it is reported as a measurement and not as a reason to prefer
+  hash pycs. The reason to prefer them is that they stay valid after extraction.
+- `compileall` must be given the enum `py_compile.PycInvalidationMode.CHECKED_HASH`;
+  the string form is ignored and writes unchecked-hash pycs instead. `compileall`
+  also skips a cache it considers valid, so it does not rewrite a timestamp pyc
+  the source tree already carries — measured on a probe, flags stayed 0 while a
+  fresh build writes 3. `bytecode_tree()` drops the `__pycache__` pycs before
+  compiling whenever the invalidation is hash-based, otherwise a build ships a
+  mix of both kinds.
+- `pyc-only` is not usable as delivered. A sourceless pyc in `__pycache__` is
+  not importable at all, so the package resolves as a namespace package and no
+  code runs. The layout that does import is the legacy one, with the pyc at the
+  module's own location — and there the import fails anyway, because
+  `torch/fx/experimental/_config.py` calls `inspect.getsource()` at import time
+  and raises `OSError: could not get source code`.
+- The timing helper reports this explicitly: it prints
+  `namespace package: no code ran` when `vllm.__file__` is None, because a
+  folder with no source imports successfully without executing anything. The
+  pyc-only build is measured at 0.019 s that way — an import that proves nothing.
+  `tools/measure_startup.py <package dir>` is the entry point for both readings:
+  pyc validity as delivered, then the entry import as uid 1000.
+
+So `pyc-only` is measured as the smaller package and rejected: 55.2 MB of
+download is below the threshold for keeping something that breaks a run. The
+mode that ships is `source`, with the cache compiled as checked-hash so the
+archive's forced mtime does not invalidate it.
 
 ## Target tags
 

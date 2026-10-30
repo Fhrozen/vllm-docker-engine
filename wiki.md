@@ -159,6 +159,12 @@ out/           generated packages, wheelhouse, locks, harness results (gitignore
   with and without `triton/backends/amd`), and env vars do not either
   (`get_cache_invalidating_env_vars()` returns `{}`). Measure each tree
   in its own process, because `triton_key()` reads files from disk.
+- Shipped bytecode must be hash-based. The runtime container runs as uid 1000 on a
+  root-owned `0o555` tree, so `__pycache__` is never rebuilt at launch, and the
+  deterministic archive forces `mtime = SOURCE_DATE_EPOCH`, which invalidates every
+  timestamp pyc it carries. That is why the rule sets `pyc_invalidation` to
+  `checked-hash`, and why `bytecode_tree()` drops the caches a source tree already
+  carries — `compileall` skips a cache it considers valid.
 - Forbidden suffixes in the shipped tree: `.a`, `.o`, `.cmake`, plus `pkgconfig/` and dev headers —
   except when the `.pyc`-only mode is *not* chosen, in which case `.py` is allowed by rule.
 - Files being present in the tree is not the same as the loader finding them. `uncovered()`

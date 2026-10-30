@@ -6,7 +6,9 @@ Run inside the container: bash docker/run.sh test
 
 import io
 import json
+import py_compile
 import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -395,6 +397,28 @@ def test_bytecode_pyc_only_removes_the_source(tmp_path):
     )
     assert list(pkg.rglob("*.py")) == []
     assert list(pkg.rglob("*.pyc"))
+    assert package.verify(pkg) == []
+
+
+def test_hash_invalidation_rewrites_a_cache_the_source_tree_carries(tmp_path):
+    src = tree(tmp_path / "src", {"foo/a.py": "print(1)\n"})
+    cache = src / "foo" / "__pycache__"
+    cache.mkdir()
+    tag = sys.implementation.cache_tag
+    py_compile.compile(
+        str(src / "foo" / "a.py"),
+        str(cache / f"a.{tag}.pyc"),
+        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP,
+    )
+    pkg = package.build(
+        src, rule(bytecode="source"), tmp_path / "out", ["sm_90a"], archive=False
+    )
+    pycs = list(pkg.rglob("*.pyc"))
+    assert len(pycs) == 1
+    # The header stores mode bits, not the enum value: bit 1 is check-source and
+    # bit 2 is hash-based, so a checked-hash pyc reads 3.
+    flags = struct.unpack("<I", pycs[0].read_bytes()[4:8])[0]
+    assert flags == py_compile.PycInvalidationMode.CHECKED_HASH.value | 1
     assert package.verify(pkg) == []
 
 

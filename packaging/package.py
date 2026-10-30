@@ -22,6 +22,7 @@ import gzip
 import hashlib
 import json
 import os
+import py_compile
 import shutil
 import subprocess
 import sys
@@ -40,6 +41,14 @@ import rules as rules_mod  # noqa: E402
 CHUNK = 1024 * 1024
 SOURCE_DATE_EPOCH = int(os.environ.get("SOURCE_DATE_EPOCH", "1600000000"))
 MANIFEST = "manifest.json"
+
+# `compileall` needs the enum, not the name: the string form writes flags=1
+# (unchecked-hash), which is not the checked-hash pyc the name promises.
+PYC_INVALIDATION = {
+    "timestamp": py_compile.PycInvalidationMode.TIMESTAMP,
+    "checked-hash": py_compile.PycInvalidationMode.CHECKED_HASH,
+    "unchecked-hash": py_compile.PycInvalidationMode.UNCHECKED_HASH,
+}
 
 
 def sha256(path: Path) -> str:
@@ -165,7 +174,16 @@ def bytecode_tree(pkg: Path, rule: dict) -> int:
     mode = rule.get("bytecode", "skip")
     if mode == "skip":
         return 0
+    invalidation = PYC_INVALIDATION[rule.get("pyc_invalidation", "checked-hash")]
     os.environ.setdefault("SOURCE_DATE_EPOCH", str(SOURCE_DATE_EPOCH))
+    # A hash pyc validates by hashing the source, so it survives the archive's
+    # forced mtime; a timestamp pyc does not, and the runtime user (uid 1000 on
+    # a 0o555 tree) cannot rebuild the cache, so every start pays for the
+    # recompile. `compileall` skips a cache it considers valid, so the caches a
+    # source tree already carries must be dropped first or the build ships a mix.
+    if invalidation is not py_compile.PycInvalidationMode.TIMESTAMP:
+        for path in pkg.rglob("__pycache__/*.pyc"):
+            path.unlink()
     # stripdir + prependdir fix the filename recorded inside the code object.
     # Without them the pyc carries the build directory, so two builds of the
     # same source into two output folders are not the same package.
@@ -175,6 +193,7 @@ def bytecode_tree(pkg: Path, rule: dict) -> int:
         workers=os.cpu_count() or 1,
         stripdir=str(pkg),
         prependdir="/",
+        invalidation_mode=invalidation,
     )
     if mode != "pyc-only":
         return 0

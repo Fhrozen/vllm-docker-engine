@@ -134,6 +134,30 @@ number. Findings so far are collected in `docs/findings.md`.
     pruned-file gate found (76.3 KB), because shipping is cheaper than breaking an
     import. Both halves now report 0 findings on 47,921 files / 10,505.7 MB.
     Details in `docs/findings.md`.
+11. **Bytecode: the cache is not built at launch, and `pyc-only` does not run.**
+    The runtime stage is `USER 1000:1000` on a root-owned tree whose members are
+    `0o555`, so `__pycache__` cannot be written — measured, the import succeeds and
+    nothing is written. `docker COPY` preserves mtimes, so the runtime image keeps
+    whatever the verify stage produced; the deterministic archive then forces
+    `mtime = SOURCE_DATE_EPOCH` on every member, which invalidates every timestamp
+    pyc it carries (21,054 of 21,064 read invalid). Hash pycs validate by hashing
+    the source, so they survive — the 7 `keep` targets are the only valid pycs left
+    after extraction. An invalid cache on a read-only tree costs about +1.4 s per
+    start — measured on the same tree before and after forcing the mtime, 4.9 s
+    against 6.3 s, 1,665 modules executed; three repeats on the invalid tree give
+    6.19 s median. The delivered checked-hash build reads as all-valid and imports
+    in 2.75 s median; the gap between those two is not explained by validation
+    cost (a hash of the source rather than a stat), so it is reported as a
+    measurement, not as a reason to prefer hash pycs — the reason is that they
+    stay valid after extraction. A sourceless pyc in `__pycache__` is not
+    importable at all, so `pyc-only` is an unimportable package: `import vllm`
+    there succeeds only as a namespace package, which is why the earlier
+    "usability ok" was a false pass.
+    The importable legacy layout then fails on `inspect.getsource()` in
+    `torch/fx/experimental/_config.py`. Size: 55.2 MB of download, below the
+    ship-it threshold. Decision: **source is kept**, and `bytecode_tree()` forces
+    checked-hash invalidation (+70.1 s build) so the caches the archive ships stay
+    valid at runtime. Details in `docs/findings.md`.
 
 ## Phases
 
